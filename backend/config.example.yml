@@ -1,0 +1,19 @@
+# This config contains settings for stack deployment
+stack_name: react-starter # Used as stack name and prefix for resources (<16 chars, cannot start with "aws")
+
+# CloudFront Configuration
+cloudfront_cache_disable: true # Set to true to disable CloudFront caching for development
+
+# CloudWatch Monitoring & Alerting Configuration
+monitoring:
+  # Email address for alerts
+  alert_email: builder@amazon.com
+
+  # Enable/disable CloudWatch alerts
+  enable_cloudwatch_alerts: true
+
+# Cognito Users Configuration
+cognito:
+  # List of email addresses to create as Cognito users
+  users:
+    - builder@amazon.com

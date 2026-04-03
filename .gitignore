@@ -1,0 +1,43 @@
+# Other
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Python
+.venv
+*__pycache__*
+
+# MISC
+cache
+.vscode
+*.DS_Store*
+
+# Build files
+frontend/dist
+frontend/aws-exports*.json
+aws-exports.json
+fictitious-readout.md
+fictitious-transcript.txt
+/.bedrock_agentcore
+
+
+# Config
+config.yml
+.env
+.bedrock_agentcore.yaml
+.bedrock_agentcore/
+.config
+.env.bak
+
+# DevSecOps - Generated files (safe to ignore)
+ferret-sast-report.json
+.ash/
+!.ash/.ash.yaml
+.eslintcache
+
+# DevSecOps - Tool cache directories
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/

@@ -1,0 +1,149 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --app-color-scheme: light;
+  color-scheme: var(--app-color-scheme);
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+}
+
+#root,
+div[data-amplify-authenticator],
+div[data-amplify-theme] {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+body {
+  background-color: #ffffff;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+body.awsui-dark-mode {
+  background-color: #0e1b2a;
+}
+
+/* CloudScape AppLayout specific fixes */
+.awsui-app-layout {
+  height: 100vh;
+  min-height: 0;
+}
+
+.awsui-app-layout-content {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.awsui-app-layout-main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+/* Ensure content within main can scroll */
+.awsui-app-layout-main > * {
+  min-height: 0;
+}
+
+/* Fix modal scrolling */
+.awsui-modal {
+  .awsui-modal-content {
+    max-height: 80vh !important;
+    overflow-y: auto !important;
+  }
+
+  .awsui-modal-body {
+    max-height: 60vh !important;
+    overflow-y: auto !important;
+  }
+}
+
+/* Ensure conversation history containers can scroll */
+.conversation-history-container {
+  overflow-y: auto !important;
+  max-height: 400px !important;
+  height: 400px !important;
+}
+
+/* Fix table scrolling in containers */
+.awsui-table-container {
+  overflow-x: auto !important;
+  overflow-y: auto !important;
+}
+
+.awsui-table {
+  .awsui-table-body-cell {
+    word-break: break-word;
+  }
+}
+
+/* Ensure SpaceBetween components don't break layout */
+.awsui-space-between {
+  min-height: 0 !important;
+  overflow: visible !important;
+}
+
+/* Fix container heights */
+.awsui-container {
+  .awsui-container-content {
+    overflow-y: auto !important;
+  }
+}
+
+/* Ensure expandable sections work with scrolling */
+.awsui-expandable-section {
+  .awsui-expandable-section-content {
+    overflow-y: auto !important;
+    max-height: 300px !important;
+  }
+}
+
+/* Fix any remaining layout issues */
+[data-awsui-referrer-id] {
+  overflow-y: auto !important;
+}
+
+/* Critical flexbox scrolling fixes based on Stack Overflow solution */
+/* Apply to all flex containers that need scrolling */
+.awsui-container,
+.awsui-content-layout,
+.awsui-content-layout-content,
+.awsui-split-panel,
+.awsui-table-wrapper {
+  min-height: 0 !important;
+}
+
+/* Ensure flex items can shrink properly */
+.awsui-app-layout-content .awsui-content-layout {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.awsui-app-layout-content .awsui-content-layout .awsui-content-layout-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Fix for pages with tables and long content */
+.awsui-table-container {
+  min-height: 0 !important;
+  flex: 1 !important;
+}

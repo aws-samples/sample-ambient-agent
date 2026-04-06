@@ -1,0 +1,158 @@
+version: "1.0"
+rules:
+  - id: SUP-00000001
+    hash: 8db83064196145e7109cb02312328dbb1adc0748a6f37e951700eafa05d9b182
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T09:44:58.430566-06:00
+    last_seen_at: 2026-02-11T09:44:58.430566-06:00
+    metadata:
+      confidence: "100"
+      context_hash: 4723b12d17875fbf
+      filename: config.example.yml
+      finding_type: BUSINESS
+      line_number: "10"
+      match_text_hash: 3c3111e8444b92eb
+  - id: SUP-00000002
+    hash: 388fbefadc1f22890d291f1c9483f09c4a94fed38b6dddeeed675ea9fa2fd44f
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T09:44:58.430566-06:00
+    last_seen_at: 2026-02-11T09:44:58.430566-06:00
+    metadata:
+      confidence: "100"
+      context_hash: 6db9cd5cc167a8d1
+      filename: config.example.yml
+      finding_type: BUSINESS
+      line_number: "19"
+      match_text_hash: 3c3111e8444b92eb
+  - id: SUP-00000003
+    hash: 084ab3a0fdc9b0ff489f22b20840c2e99f1afd05d19e9ad492c4648171a9d74c
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T11:44:41.648543-06:00
+    last_seen_at: 2026-02-11T11:44:41.648543-06:00
+    metadata:
+      confidence: "56"
+      context_hash: 4723b12d17875fbf
+      filename: README.md
+      finding_type: BUSINESS
+      line_number: "118"
+      match_text_hash: 587e1a2bcbc4f926
+  - id: SUP-00000004
+    hash: 6a375f0f3e1445609fec884a258a028966dbbb15758595ac22cd3656e9ce4086
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T11:44:41.648543-06:00
+    last_seen_at: 2026-02-11T11:44:41.648543-06:00
+    metadata:
+      confidence: "40"
+      context_hash: 6db9cd5cc167a8d1
+      filename: README.md
+      finding_type: BUSINESS
+      line_number: "123"
+      match_text_hash: b36a83701f1c3191
+  - id: SUP-00000005
+    hash: 5b3f2e6e0bd5342d8d423e2868815ee0f0a0c01c98dd35cbb79174117661a613
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T11:44:41.648543-06:00
+    last_seen_at: 2026-02-11T11:44:41.648543-06:00
+    metadata:
+      confidence: "40"
+      context_hash: 6db9cd5cc167a8d1
+      filename: README.md
+      finding_type: BUSINESS
+      line_number: "124"
+      match_text_hash: 2b3b2b9ce842ab8b
+  - id: SUP-00000006
+    hash: 6223021e07afe3ec94223e61b2419a7a0856f1fc39e67593d979f57a9f5a9b41
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T11:44:41.648543-06:00
+    last_seen_at: 2026-02-11T11:44:41.648543-06:00
+    metadata:
+      confidence: "67"
+      context_hash: ""
+      filename: README.md
+      finding_type: PERSON_NAME
+      line_number: "35"
+      match_text_hash: d5f64de5ebf1d0ea
+  - id: SUP-00000007
+    hash: 45d9808f6cce4ad5692d46d36f6f6193a91e11820151beb5e9882e6302dc4788
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T11:47:15.918652-06:00
+    last_seen_at: 2026-02-11T11:47:15.918652-06:00
+    metadata:
+      confidence: "70"
+      context_hash: 49a0f8a3cd821adb
+      filename: calculator.py
+      finding_type: INTELLECTUAL_PROPERTY
+      line_number: "58"
+      match_text_hash: 7a0d91593df9293a
+  - id: SUP-00000008
+    hash: 0d06a0cce47919b85cf1427140f4e9e40161c6811bf86caa47315e736cf579c0
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T14:34:57.407378-06:00
+    last_seen_at: 2026-02-11T14:54:40.661178-06:00
+    metadata:
+      confidence: "70"
+      context_hash: 49a0f8a3cd821adb
+      filename: calculator.py
+      finding_type: INTELLECTUAL_PROPERTY
+      line_number: "60"
+      match_text_hash: 7a0d91593df9293a
+  - id: SUP-00000009
+    hash: f6e8ab993bdae57b74280cb59c50a1dc154d5802a4f687a1d5b278324970bcad
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-02-11T14:54:16.458514-06:00
+    last_seen_at: 2026-03-04T14:15:32.780638-06:00
+    metadata:
+      confidence: "77"
+      context_hash: ed8ee82114967cfa
+      filename: licensecheck.toml
+      finding_type: INTELLECTUAL_PROPERTY
+      line_number: "18"
+      match_text_hash: 9049697da52b7e0e
+  - id: SUP-00000010
+    hash: de05f8521f6fffa1727a5fdb4cf41e305c4caeb3d2ebc15c12b2a297357326f5
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-03-04T14:15:32.780638-06:00
+    last_seen_at: 2026-03-04T14:15:32.780638-06:00
+    metadata:
+      confidence: "56"
+      context_hash: 4723b12d17875fbf
+      filename: README.md
+      finding_type: BUSINESS
+      line_number: "111"
+      match_text_hash: 587e1a2bcbc4f926
+  - id: SUP-00000011
+    hash: 7cb3f7c9597aea0141244ee25d10514464701e091db765ff8c1a400261617225
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-03-04T14:15:32.780638-06:00
+    last_seen_at: 2026-03-04T14:15:32.780638-06:00
+    metadata:
+      confidence: "40"
+      context_hash: 6db9cd5cc167a8d1
+      filename: README.md
+      finding_type: BUSINESS
+      line_number: "116"
+      match_text_hash: b36a83701f1c3191
+  - id: SUP-00000012
+    hash: d422744c1b53c5f0aa0c52d02c0e085179c14154400a1ca3ce56d599dc1bc4c5
+    reason: Auto-generated suppression rule (disabled by default)
+    enabled: true
+    created_at: 2026-03-04T14:15:32.780638-06:00
+    last_seen_at: 2026-03-04T14:15:32.780638-06:00
+    metadata:
+      confidence: "40"
+      context_hash: 6db9cd5cc167a8d1
+      filename: README.md
+      finding_type: BUSINESS
+      line_number: "117"
+      match_text_hash: 2b3b2b9ce842ab8b

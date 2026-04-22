@@ -409,7 +409,14 @@ class MultiAgentStack(Stack):
             )
         )
 
-        # Grant Bedrock Agent Core permissions
+        # Grant Bedrock Agent Core permissions.
+        # The agent registry stores full ARNs from whatever region the user
+        # deployed the AgentCore runtime in (e.g., us-east-1), which may
+        # differ from this stack's region. Use a region wildcard so the
+        # Lambda can invoke runtimes registered from any region in this
+        # account. InvokeAgentRuntime authorizes against both the runtime
+        # resource and the runtime-endpoint resource, so both patterns are
+        # granted.
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
@@ -417,7 +424,8 @@ class MultiAgentStack(Stack):
                     "bedrock-agentcore:InvokeAgentRuntime",
                 ],
                 resources=[
-                    f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:runtime/*",
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
                 ],
             )
         )

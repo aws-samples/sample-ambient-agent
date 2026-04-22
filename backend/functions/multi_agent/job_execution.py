@@ -14,7 +14,29 @@ logger = Logger(service="job-execution", level="INFO")
 # Initialize AWS clients
 dynamodb = boto3.resource("dynamodb")
 bedrock_agent_runtime = boto3.client("bedrock-agent-runtime")
+# Default bedrock-agentcore client (uses Lambda's region). The actual client
+# used for invocation is built per-call from the agent ARN's region, since
+# AgentCore runtimes may live in a different region than this Lambda.
 bedrock_agentcore = boto3.client("bedrock-agentcore")
+
+
+def _agentcore_client_for_arn(agent_arn: str):
+    """Return a bedrock-agentcore client pinned to the region in the agent ARN.
+
+    The agent registry stores full ARNs, and the runtime may be deployed in
+    a different region than this Lambda. Building a region-specific client
+    ensures the request is signed and routed to the correct regional
+    endpoint.
+    """
+    try:
+        # ARN format: arn:aws:bedrock-agentcore:<region>:<account>:runtime/<id>
+        arn_region = agent_arn.split(":")[3]
+    except (IndexError, AttributeError):
+        arn_region = None
+
+    if arn_region:
+        return boto3.client("bedrock-agentcore", region_name=arn_region)
+    return bedrock_agentcore
 
 # Environment variables
 TASK_REGISTRY_TABLE = os.environ["TASK_REGISTRY_TABLE"]
@@ -338,7 +360,11 @@ def execute_task(job: Dict[str, Any], human_response: str = None) -> Dict[str, A
                 "Sending request to Bedrock Agent Core", extra={"job_id": job_id}
             )
             append_execution_log(job_id, "info", "Sending request to agent")
-            response = bedrock_agentcore.invoke_agent_runtime(
+            # Build a client pinned to the region encoded in the agent ARN
+            # so the request is signed/routed to the correct regional endpoint
+            # regardless of which region this Lambda is running in.
+            agentcore_client = _agentcore_client_for_arn(agent_arn)
+            response = agentcore_client.invoke_agent_runtime(
                 agentRuntimeArn=agent_arn,  # Use the full ARN from the agent registry
                 runtimeSessionId=session_id,
                 payload=payload,

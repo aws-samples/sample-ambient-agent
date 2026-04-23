@@ -275,19 +275,44 @@ def add_conversation_message(
 
 
 def verify_user_access_to_session(user_id: str, session_id: str) -> bool:
-    """Verify that the user has access to this session (fail-closed)"""
+    """Verify that the user has access to this session (fail-closed).
+
+    A user owns a session if any of these is true:
+      1. They own a job whose `sessionId` matches (classic job flow), OR
+      2. They own a chat thread whose `sessionId` matches (new chat flow).
+
+    We check both sources so the existing /conversations endpoint serves chat
+    threads as well as jobs.
+    """
     try:
         task_table = dynamodb.Table(os.environ["TASK_REGISTRY_TABLE"])
 
-        response = task_table.scan(
+        task_response = task_table.scan(
             FilterExpression="sessionId = :session_id AND userId = :user_id",
             ExpressionAttributeValues={
                 ":session_id": session_id,
                 ":user_id": user_id,
             },
         )
+        if task_response.get("Items"):
+            return True
 
-        return bool(response.get("Items"))
+        # Fall back to chat-threads if the env var is configured (it will be
+        # when this Lambda is wired up to the chat feature).
+        chat_threads_table_name = os.environ.get("CHAT_THREADS_TABLE")
+        if chat_threads_table_name:
+            chat_table = dynamodb.Table(chat_threads_table_name)
+            chat_response = chat_table.scan(
+                FilterExpression="sessionId = :session_id AND userId = :user_id",
+                ExpressionAttributeValues={
+                    ":session_id": session_id,
+                    ":user_id": user_id,
+                },
+            )
+            if chat_response.get("Items"):
+                return True
+
+        return False
 
     except Exception as e:
         logger.error(

@@ -64,6 +64,7 @@ class MultiAgentStack(Stack):
         self.task_registry_table = self._create_task_registry_table()
         self.conversation_store_table = self._create_conversation_store_table()
         self.ambient_signals_table = self._create_ambient_signals_table()
+        self.chat_threads_table = self._create_chat_threads_table()
 
         # Create Lambda Powertools layer reference
         self.powertools_layer = _lambda.LayerVersion.from_layer_version_arn(
@@ -82,6 +83,10 @@ class MultiAgentStack(Stack):
         )
         self.signal_management_function = self._create_signal_management_function()
         self.signal_processor_function = self._create_signal_processor_function()
+        # Chat execution must be built before chat management so the latter
+        # can reference its ARN for async invocation.
+        self.chat_execution_function = self._create_chat_execution_function()
+        self.chat_management_function = self._create_chat_management_function()
 
         # Create API Gateway resources
         self.api_gateway = self._create_api_gateway()
@@ -98,6 +103,8 @@ class MultiAgentStack(Stack):
             self.conversation_management_function,
             self.signal_management_function,
             self.signal_processor_function,
+            self.chat_management_function,
+            self.chat_execution_function,
         ]:
             fn.add_environment("ALLOWED_ORIGIN", allowed_origin)
 
@@ -517,10 +524,14 @@ class MultiAgentStack(Stack):
             ],
         )
 
-        # Grant DynamoDB permissions
+        # Grant DynamoDB permissions. Conversation access is authorized by
+        # verifying ownership against either the jobs table (classic job flow)
+        # or the chat-threads table (standalone chat flow), so we need read
+        # access to both.
         self.conversation_store_table.grant_read_write_data(lambda_role)
         self.agent_registry_table.grant_read_data(lambda_role)
         self.task_registry_table.grant_read_data(lambda_role)
+        self.chat_threads_table.grant_read_data(lambda_role)
 
         function = _lambda.Function(
             self,
@@ -537,6 +548,7 @@ class MultiAgentStack(Stack):
                 "CONVERSATION_STORE_TABLE": self.conversation_store_table.table_name,
                 "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
                 "TASK_REGISTRY_TABLE": self.task_registry_table.table_name,
+                "CHAT_THREADS_TABLE": self.chat_threads_table.table_name,
                 "REGION": self.region,
             },
         )
@@ -675,6 +687,133 @@ class MultiAgentStack(Stack):
         # Note: S3 bucket notification permissions are added dynamically by signal_management
         # when signals are created/updated, using the statement ID pattern:
         # s3-invoke-signal-{signalId}
+
+        return function
+
+    def _create_chat_threads_table(self) -> dynamodb.Table:
+        """Create DynamoDB table for chat threads.
+
+        Rows carry thread metadata only. Messages live in the shared
+        conversation-store table keyed by sessionId, so they are not
+        duplicated here.
+        """
+        table = dynamodb.Table(
+            self,
+            f"{self.config.stack_name}-ChatThreadsTable",
+            table_name=f"{self.config.stack_name}-chat-threads",
+            partition_key=dynamodb.Attribute(
+                name="threadId", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.AWS_MANAGED,
+            point_in_time_recovery=True,
+            time_to_live_attribute="ttl",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # GSI lets the chat UI list a user's threads sorted by recency.
+        table.add_global_secondary_index(
+            index_name="userId-updatedAt-index",
+            partition_key=dynamodb.Attribute(
+                name="userId", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="updatedAt", type=dynamodb.AttributeType.STRING
+            ),
+        )
+
+        return table
+
+    def _create_chat_execution_function(self) -> _lambda.Function:
+        """Create Lambda that performs the actual AgentCore call for a chat turn."""
+        lambda_role = iam.Role(
+            self,
+            f"{self.config.stack_name}-ChatExecutionRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                ),
+            ],
+        )
+
+        self.chat_threads_table.grant_read_write_data(lambda_role)
+        self.conversation_store_table.grant_read_write_data(lambda_role)
+        self.agent_registry_table.grant_read_data(lambda_role)
+
+        # Same region-wildcard policy as the job executor so chat can invoke
+        # AgentCore runtimes registered in any region of this account.
+        lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock-agentcore:InvokeAgentRuntime"],
+                resources=[
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
+                ],
+            )
+        )
+
+        function = _lambda.Function(
+            self,
+            f"{self.config.stack_name}-ChatExecutionFunction",
+            function_name=f"{self.config.stack_name}-chat-execution",
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            handler="chat_execution.handler",
+            code=_lambda.Code.from_asset("functions/multi_agent"),
+            timeout=Duration.minutes(10),
+            memory_size=512,
+            role=lambda_role,
+            layers=[self.powertools_layer],
+            environment={
+                "CHAT_THREADS_TABLE": self.chat_threads_table.table_name,
+                "CONVERSATION_STORE_TABLE": self.conversation_store_table.table_name,
+                "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
+                "REGION": self.region,
+            },
+        )
+
+        return function
+
+    def _create_chat_management_function(self) -> _lambda.Function:
+        """Create the Lambda that handles /chats CRUD + message POSTs."""
+        lambda_role = iam.Role(
+            self,
+            f"{self.config.stack_name}-ChatManagementRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                ),
+            ],
+        )
+
+        self.chat_threads_table.grant_read_write_data(lambda_role)
+        self.conversation_store_table.grant_read_write_data(lambda_role)
+        self.agent_registry_table.grant_read_data(lambda_role)
+
+        # Allow async-invoking the chat executor for message turns.
+        self.chat_execution_function.grant_invoke(lambda_role)
+
+        function = _lambda.Function(
+            self,
+            f"{self.config.stack_name}-ChatManagementFunction",
+            function_name=f"{self.config.stack_name}-chat-management",
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            handler="chat_management.handler",
+            code=_lambda.Code.from_asset("functions/multi_agent"),
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            role=lambda_role,
+            layers=[self.powertools_layer],
+            environment={
+                "CHAT_THREADS_TABLE": self.chat_threads_table.table_name,
+                "CONVERSATION_STORE_TABLE": self.conversation_store_table.table_name,
+                "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
+                "CHAT_EXECUTION_FUNCTION_NAME": self.chat_execution_function.function_name,
+                "REGION": self.region,
+            },
+        )
 
         return function
 
@@ -887,6 +1026,43 @@ class MultiAgentStack(Stack):
             authorizer=authorizer,
         )
 
+        # Chat routes - standalone agent chat decoupled from jobs.
+        chats_resource = api.root.add_resource("chats")
+        chats_resource.add_method(
+            "GET",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+        chats_resource.add_method(
+            "POST",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+
+        chat_thread_resource = chats_resource.add_resource("{threadId}")
+        chat_thread_resource.add_method(
+            "GET",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+        chat_thread_resource.add_method(
+            "DELETE",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+
+        chat_messages_resource = chat_thread_resource.add_resource("messages")
+        chat_messages_resource.add_method(
+            "POST",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+
         return api
 
     def _add_cors_preflight(self, allowed_origin: str):
@@ -982,6 +1158,41 @@ class MultiAgentStack(Stack):
             ),
         )
 
+        # SPA routing: rewrite any extension-less request path to /index.html
+        # at the viewer-request stage of the default (S3) behavior. The
+        # function is scoped to the default behavior only so API responses
+        # on /prod/* pass through untouched.
+        spa_router_fn = cloudfront.Function(
+
+            self,
+            f"{self.config.stack_name}-SpaRouterFunction",
+            function_name=f"{self.config.stack_name}-spa-router",
+            comment=(
+                "Rewrites client-side React Router paths to /index.html so "
+                "deep links and page refreshes load the SPA shell."
+            ),
+            code=cloudfront.FunctionCode.from_inline(
+                """
+function handler(event) {
+    var request = event.request;
+    var uri = request.uri;
+    if (uri === '' || uri === '/') {
+        return request;
+    }
+    // Paths with a file extension are real assets; everything else is a
+    // React Router path and gets rewritten to the SPA shell.
+    var hasExtension = /\\.[a-zA-Z0-9]{1,8}$/.test(uri);
+    if (hasExtension) {
+        return request;
+    }
+    request.uri = '/index.html';
+    return request;
+}
+"""
+            ),
+        )
+
+
         distribution = cloudfront.Distribution(
             self,
             f"{self.config.stack_name}-Distribution",
@@ -993,6 +1204,12 @@ class MultiAgentStack(Stack):
                 compress=True,
                 cache_policy=default_cache_policy,
                 response_headers_policy=security_headers_policy,
+                function_associations=[
+                    cloudfront.FunctionAssociation(
+                        function=spa_router_fn,
+                        event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                    ),
+                ],
             ),
             additional_behaviors={
                 "/assets/*": cloudfront.BehaviorOptions(
@@ -1030,18 +1247,14 @@ class MultiAgentStack(Stack):
                     origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
                 ),
             },
-            error_responses=[
-                cloudfront.ErrorResponse(
-                    http_status=404,
-                    response_http_status=200,
-                    response_page_path="/index.html",
-                    ttl=Duration.seconds(0),
-                ),
-            ],
+            # SPA fallback is handled by spa_router_fn so API 404s on
+            # /prod/* pass through as genuine 404s.
             enable_ipv6=False,
+
             enable_logging=True,
             log_bucket=cloudfront_access_logs_bucket,
         )
+
 
         NagSuppressions.add_resource_suppressions(
             distribution,

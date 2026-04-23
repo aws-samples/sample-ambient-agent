@@ -33,6 +33,7 @@ import BaseAppLayout from "../components/base-app-layout";
 import ConversationHistory, {
   InlineConversationHistory,
 } from "../components/conversation-history";
+import ChatPanel, { ChatPanelStatus } from "../components/chat-panel";
 import { apiClient } from "../common/api-client/api-clients";
 import {
   Job,
@@ -41,6 +42,22 @@ import {
   Agent,
 } from "../types/multi-agent";
 import { TaskExecutionLog } from "../types/multi-agent";
+
+/**
+ * Map a job's status + requiresAction flag onto the ChatPanel status states.
+ * - `busy` / `scheduled_for_execution` -> "busy" (agent is working)
+ * - interrupted or requiresAction=true -> "awaiting_human"
+ * - otherwise                          -> "idle"
+ */
+function jobStatusToChatStatus(job: Job): ChatPanelStatus {
+  if (job.status === "busy" || job.status === "scheduled_for_execution") {
+    return "busy";
+  }
+  if (job.status === "interrupted" || job.requiresAction) {
+    return "awaiting_human";
+  }
+  return "idle";
+}
 
 export default function TasksPage() {
   const queryClient = useQueryClient();
@@ -677,11 +694,41 @@ export default function TasksPage() {
                 }
                 tabs={[
                   {
-                    label: "Conversation History",
+                    label: "Chat",
                     id: "conversation",
                     content: specificTask.sessionId ? (
-                      <ConversationHistory
+                      <ChatPanel
                         sessionId={specificTask.sessionId}
+                        status={jobStatusToChatStatus(specificTask)}
+                        onSendMessage={async (message) => {
+                          // Sending on a job-detail chat calls the existing
+                          // execute endpoint. For an interrupted job we
+                          // forward the message as `humanResponse` so the
+                          // agent's continuation flow picks it up; for any
+                          // other status (idle/completed) we start a fresh
+                          // execution with the message as the new prompt via
+                          // a conversation-store append + execute, matching
+                          // the previous behaviour.
+                          await apiClient.multiAgentClient.executeTask(
+                            specificTask.jobId,
+                            { humanResponse: message },
+                          );
+                          // Optimistically mark the job busy so the panel
+                          // locks its composer; the polling effect above
+                          // will refresh the real status.
+                          queryClient.setQueryData(
+                            ["job", specificTask.jobId],
+                            (old: any) =>
+                              old
+                                ? { ...old, status: "busy", requiresAction: false }
+                                : old,
+                          );
+                          queryClient.invalidateQueries({
+                            queryKey: ["conversation", specificTask.sessionId],
+                          });
+                        }}
+                        title="Chat"
+                        subtitle={`Job: ${specificTask.jobName}`}
                         maxHeight="600px"
                       />
                     ) : (

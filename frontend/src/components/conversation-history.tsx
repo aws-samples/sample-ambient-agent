@@ -28,32 +28,37 @@ export default function ConversationHistory({
   sessionId,
   maxHeight = "400px",
 }: ConversationHistoryProps) {
-  // Fetch conversation history - but don't show loading initially
+  // Fetch conversation history. The conversation record is created by the
+  // backend after the agent produces its first response, so an initial 404
+  // is expected while the job is still running. We poll on an interval while
+  // the conversation is missing so the UI picks up the first message as soon
+  // as it is persisted.
   const {
     data: conversation,
     isLoading,
     error,
-    refetch,
   } = useQuery({
     queryKey: ["conversation", sessionId],
     queryFn: () =>
       apiClient.multiAgentClient.getConversation(sessionId, { limit: 50 }),
     enabled: !!sessionId,
-    // Prevent duplicate data issues with better caching strategy
-    staleTime: 30000, // Consider data fresh for 30 seconds
-    refetchOnWindowFocus: false, // Don't refetch on window focus
-    refetchOnMount: false, // Don't refetch on component mount if data exists
-    refetchOnReconnect: false, // Don't refetch on network reconnect
-    retry: false, // Don't retry on failure - conversation might not exist yet
+    staleTime: 5000,
+    refetchOnWindowFocus: true,
+    refetchOnMount: true,
+    refetchOnReconnect: true,
+    retry: false,
+    // Poll every 3 seconds as long as no conversation has been loaded yet
+    // (either the query errored with 404 or returned an empty conversation).
+    // Stop polling once messages are present.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data || data.totalMessages === 0) {
+        return 3000;
+      }
+      return false;
+    },
+    refetchIntervalInBackground: false,
   });
-
-  // Only refetch if we have a sessionId but no conversation data and we're not already loading
-  React.useEffect(() => {
-    if (sessionId && !conversation && !isLoading && !error) {
-      // Single refetch attempt - no retries to prevent duplication
-      refetch();
-    }
-  }, [sessionId]); // Only depend on sessionId to prevent excessive refetches
 
   // Show "Job Starting" by default when no conversation exists yet or is loading
   if (isLoading || error || !conversation || conversation.totalMessages === 0) {

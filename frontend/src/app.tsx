@@ -14,6 +14,7 @@ import WorkflowsPage from "./pages/workflows";
 import AgentsPage from "./pages/agents";
 import JobsPage from "./pages/jobs";
 import SignalsPage from "./pages/signals";
+import ChatPage from "./pages/chat";
 import "./styles/app.scss";
 
 export default function App() {
@@ -47,6 +48,8 @@ export default function App() {
             <Route path="/agents" element={<AgentsPage />} />
             <Route path="/jobs" element={<JobsPage />} />
             <Route path="/signals" element={<SignalsPage />} />
+            <Route path="/chat" element={<ChatPage />} />
+            <Route path="/chat/:threadId" element={<ChatPage />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </div>

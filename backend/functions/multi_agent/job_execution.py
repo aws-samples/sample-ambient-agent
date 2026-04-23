@@ -107,10 +107,22 @@ def handle_api_execution(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Update job status to busy immediately
         update_task_status(job_id, "busy")
 
+        # Persist the human turn synchronously before async execution kicks
+        # off, so the conversation reflects the new message on the very next
+        # client poll. save_conversation_turn() dedupes against the last
+        # human turn, so the eventual write after the agent responds is safe.
+        if human_response:
+            session_id = job.get("sessionId")
+            agent_id = job.get("agentId")
+            if session_id and agent_id:
+                append_human_turn(session_id, agent_id, human_response)
+
+
         # Start async execution using Lambda invoke
         import boto3
 
         lambda_client = boto3.client("lambda")
+
 
         # Prepare payload for async execution
         async_payload = {
@@ -743,10 +755,58 @@ def load_conversation_context(session_id: str, agent_id: str) -> str:
         return ""
 
 
+def append_human_turn(session_id: str, agent_id: str, human_input: str) -> None:
+    """Persist the human side of a turn to the conversation store.
+
+    Idempotent against the last human message, so calling this and then
+    `save_conversation_turn` later will not duplicate the entry.
+    """
+    try:
+        now = datetime.utcnow().isoformat()
+        response = conversation_table.get_item(Key={"sessionId": session_id})
+
+        if "Item" in response:
+            conversation = response["Item"]
+            messages = conversation.get("messages", [])
+        else:
+            conversation = {
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "createdAt": now,
+                "messages": [],
+            }
+            messages = []
+
+        last_human = next(
+            (m for m in reversed(messages) if m.get("type") == "human"), None
+        )
+        if last_human and last_human.get("content") == human_input:
+            return
+
+        messages.append(
+            {"type": "human", "content": human_input, "timestamp": now}
+        )
+        conversation["messages"] = messages
+        conversation["updatedAt"] = now
+        conversation["ttl"] = int(
+            (datetime.utcnow() + timedelta(days=30)).timestamp()
+        )
+        conversation_table.put_item(Item=conversation)
+    except Exception as e:
+        # Non-fatal: save_conversation_turn will persist the turn later.
+        logger.error(
+            "Human turn pre-persist failed",
+            extra={"error": str(e), "session_id": session_id},
+            exc_info=True,
+        )
+
+
+
 def save_conversation_turn(
     session_id: str, agent_id: str, human_input: str, agent_response: str
 ):
     """Save a conversation turn for agents that support continuity"""
+
     try:
         now = datetime.utcnow().isoformat()
 

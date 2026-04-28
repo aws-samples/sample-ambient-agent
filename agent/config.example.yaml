@@ -17,6 +17,23 @@ agent:
 execution:
   search_cooldown_seconds: 1
 
+  # Loop detector: short-circuits when the same action signature repeats
+  # more than `max_identical_actions` times within the sliding window.
+  loop_detector:
+    max_identical_actions: 3
+    window_size: 10
+
+  # Circuit breaker for identical queries fired back-to-back.
+  circuit_breaker:
+    max_calls: 2
+    cooldown_seconds: 1
+
+  # Bound the per-session state caches inside the agent container.
+  session_cache:
+    max_sessions: 200
+    ttl_seconds: 3600
+
+
 # Tool Configuration
 # Enable/disable tools and customize their behavior
 tools:

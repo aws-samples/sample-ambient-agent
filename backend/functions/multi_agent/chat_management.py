@@ -32,6 +32,8 @@ from typing import Any, Dict, Optional
 import boto3
 from aws_lambda_powertools import Logger
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+
 
 logger = Logger(service="chat-management", level="INFO")
 
@@ -192,7 +194,10 @@ def _send_message(
 
     # Append the human turn to conversation-store so the UI picks it up
     # immediately on the next poll, before the agent responds.
-    _append_conversation_turn(session_id, thread["agentId"], "human", message)
+    _append_conversation_turn(
+        session_id, thread["agentId"], user_id, "human", message
+    )
+
 
     # Mark the thread busy and update preview.
     awaiting_human = thread.get("status") == "awaiting_human"
@@ -252,35 +257,58 @@ def _load_owned_thread(user_id: str, thread_id: str) -> Optional[Dict[str, Any]]
     return item
 
 
-def _append_conversation_turn(
-    session_id: str, agent_id: str, msg_type: str, content: str
+def _ensure_conversation_exists(
+    session_id: str, agent_id: str, user_id: str
 ) -> None:
-    """Append a single message to the conversation-store item for `session_id`.
-
-    Uses the same shape the job_execution Lambda writes, so the existing
-    conversation-management GET endpoint returns chat messages without change.
-    """
+    """Conditional put so concurrent writers do not overwrite each other."""
     now = datetime.utcnow().isoformat()
-    resp = conversation_table.get_item(Key={"sessionId": session_id})
-    if "Item" in resp:
-        conversation = resp["Item"]
-        messages = conversation.get("messages", [])
-    else:
-        conversation = {
-            "sessionId": session_id,
-            "agentId": agent_id,
-            "createdAt": now,
-            "messages": [],
-        }
-        messages = []
+    ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+    try:
+        conversation_table.put_item(
+            Item={
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "userId": user_id,
+                "createdAt": now,
+                "updatedAt": now,
+                "messages": [],
+                "ttl": ttl,
+            },
+            ConditionExpression="attribute_not_exists(sessionId)",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
 
-    messages.append({"type": msg_type, "content": content, "timestamp": now})
-    conversation["messages"] = messages
-    conversation["updatedAt"] = now
-    conversation["ttl"] = int(
-        (datetime.utcnow() + timedelta(days=30)).timestamp()
+
+def _append_conversation_turn(
+    session_id: str, agent_id: str, user_id: str, msg_type: str, content: str
+) -> None:
+    """Append a turn atomically via list_append.
+
+    Uses the same shape as job_execution's writer so the existing
+    conversation-management GET endpoint returns chat messages without
+    change.
+    """
+    _ensure_conversation_exists(session_id, agent_id, user_id)
+    now = datetime.utcnow().isoformat()
+    ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+    conversation_table.update_item(
+        Key={"sessionId": session_id},
+        UpdateExpression=(
+            "SET messages = list_append(if_not_exists(messages, :empty), :turn), "
+            "updatedAt = :now, "
+            "#ttl = :ttl"
+        ),
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":empty": [],
+            ":turn": [{"type": msg_type, "content": content, "timestamp": now}],
+            ":now": now,
+            ":ttl": ttl,
+        },
     )
-    conversation_table.put_item(Item=conversation)
+
 
 
 def _extract_user_id(event: Dict[str, Any]) -> str:

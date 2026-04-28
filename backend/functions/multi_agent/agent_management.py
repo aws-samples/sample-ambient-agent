@@ -310,42 +310,6 @@ def delete_agent(user_id: str, agent_id: str) -> Dict[str, Any]:
         logger.error("Agent deletion failed", extra={"error": str(e)}, exc_info=True)
         return create_response(500, {"error": "Failed to delete agent"})
 
-
-def extract_agent_id_from_arn(agent_arn: str) -> str:
-    """
-    Extract and validate agent ID from Bedrock Agent ARN
-
-    AWS Bedrock agent IDs must:
-    - Be alphanumeric only (no hyphens, underscores, etc.)
-    - Be 10 characters or less
-
-    If the ARN contains an invalid agent ID, we'll generate a valid one
-    """
-    # ARN format: arn:aws:bedrock-agent:region:account:agent/agent-id
-    raw_agent_id = agent_arn.split("/")[-1]
-
-    # Remove non-alphanumeric characters
-    clean_agent_id = "".join(c for c in raw_agent_id if c.isalnum())
-
-    # Truncate to 10 characters if needed
-    if len(clean_agent_id) > 10:
-        clean_agent_id = clean_agent_id[:10]
-
-    # If the cleaned ID is empty or too short, generate a fallback
-    if len(clean_agent_id) < 3:
-        import hashlib
-
-        # Generate a consistent hash-based ID from the original ARN
-        hash_obj = hashlib.sha256(raw_agent_id.encode())
-        clean_agent_id = hash_obj.hexdigest()[:10]
-
-    logger.info(
-        "Agent ID converted for Bedrock compatibility",
-        extra={"original_id": raw_agent_id, "converted_id": clean_agent_id},
-    )
-    return clean_agent_id
-
-
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
     """Create standardized API response"""
     return {

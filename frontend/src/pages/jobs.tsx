@@ -59,6 +59,35 @@ function jobStatusToChatStatus(job: Job): ChatPanelStatus {
   return "idle";
 }
 
+type JobType = Job["jobType"];
+
+function jobTypeBadgeColor(
+  jobType: JobType | string,
+): "blue" | "green" | "grey" {
+  switch (jobType) {
+    case "scheduled":
+      return "blue";
+    case "signal_triggered":
+      return "green";
+    default:
+      return "grey";
+  }
+}
+
+function jobTypeLabel(jobType: JobType | string): string {
+  switch (jobType) {
+    case "signal_triggered":
+      return "signal triggered";
+    case "user_initiated":
+      return "user initiated";
+    case "scheduled":
+      return "scheduled";
+    default:
+      return String(jobType).replace(/_/g, " ");
+  }
+}
+
+
 export default function TasksPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -71,7 +100,10 @@ export default function TasksPage() {
   const [currentPageIndex, setCurrentPageIndex] = useState(1);
   const [activeTabId, setActiveTabId] = useState("all");
   const [recentlyViewedTasks, setRecentlyViewedTasks] = useState<Job[]>([]);
-  const [taskDetailTabId, setTaskDetailTabId] = useState("details");
+  // Default to the Chat tab when a user opens a job detail. The
+  // primary workflow is "arrive at the job -> chat with the agent",
+  // so expanding the chat panel immediately saves a click every time.
+  const [taskDetailTabId, setTaskDetailTabId] = useState("conversation");
   const pageSize = 10;
 
   // Get jobId from URL params if present
@@ -649,13 +681,10 @@ export default function TasksPage() {
                   </div>
                   <div>
                     <Box variant="awsui-key-label">Type</Box>
-                    <Badge
-                      color={
-                        specificTask.jobType === "scheduled" ? "blue" : "grey"
-                      }
-                    >
-                      {specificTask.jobType.replace("_", " ")}
+                    <Badge color={jobTypeBadgeColor(specificTask.jobType)}>
+                      {jobTypeLabel(specificTask.jobType)}
                     </Badge>
+
                   </div>
                   <div>
                     <Box variant="awsui-key-label">Requires Action</Box>
@@ -1005,13 +1034,12 @@ export default function TasksPage() {
                   id: "type",
                   header: "Type",
                   cell: (job: Job) => (
-                    <Badge
-                      color={job.jobType === "scheduled" ? "blue" : "grey"}
-                    >
-                      {job.jobType.replace("_", " ")}
+                    <Badge color={jobTypeBadgeColor(job.jobType)}>
+                      {jobTypeLabel(job.jobType)}
                     </Badge>
                   ),
                 },
+
                 {
                   id: "status",
                   header: "Status",

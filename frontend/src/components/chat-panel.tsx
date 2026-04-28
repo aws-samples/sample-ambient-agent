@@ -248,7 +248,15 @@ export default function ChatPanel({
       </div>
 
       <div ref={scrollRef} style={scrollStyle}>
-        {(isLoading || isFetching) && messages.length === 0 ? (
+        {/*
+          Only show the loading spinner on the very first fetch before
+          any message data has landed (`isLoading`). `isFetching` flips
+          to true on every poll interval; gating the spinner on it too
+          caused a 2-second flicker between poll cycles whenever the
+          message list was briefly empty. Background refetches now
+          happen silently; the existing messages stay rendered.
+        */}
+        {isLoading && messages.length === 0 ? (
           <div
             style={{
               display: "flex",
@@ -268,7 +276,25 @@ export default function ChatPanel({
             </Box>
           </Box>
         ) : messages.length === 0 ? (
-          <EmptyState agentLabel={agentLabel} />
+          // If the job is already running against an empty session,
+          // show the typing indicator instead of the "start chatting"
+          // empty state. This covers signal-triggered jobs where the
+          // worker is invoking the agent before any turns have landed.
+          status === "busy" ? (
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "16px",
+                maxWidth: "820px",
+                margin: "0 auto",
+              }}
+            >
+              <TypingIndicator agentLabel={agentLabel} />
+            </div>
+          ) : (
+            <EmptyState agentLabel={agentLabel} />
+          )
         ) : (
           <div
             style={{

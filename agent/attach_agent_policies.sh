@@ -101,39 +101,36 @@ get_role_from_config() {
     return 1
 }
 
-# Function to merge policy files
+# Function to merge policy files into a single IAM policy document.
+
 merge_policies() {
     local policies_dir="$1"
     local output_file="$2"
 
-    # Start building the merged policy
-    echo '{' > "$output_file"
-    echo '  "Version": "2012-10-17",' >> "$output_file"
-    echo '  "Statement": [' >> "$output_file"
+    python - "$policies_dir" "$output_file" <<'PY'
+import glob
+import json
+import os
+import sys
 
-    local first=true
-    for policy_file in "$policies_dir"/*.json; do
-        if [ -f "$policy_file" ]; then
-            # Extract statements from each policy file
-            local statements=$(jq -r '.Statement[]' "$policy_file" 2>/dev/null)
-            if [ $? -eq 0 ] && [ -n "$statements" ]; then
-                if [ "$first" = false ]; then
-                    echo '    ,' >> "$output_file"
-                fi
-                jq -c '.Statement[]' "$policy_file" | while read -r statement; do
-                    if [ "$first" = false ]; then
-                        echo '    ,' >> "$output_file"
-                    fi
-                    echo "    $statement" >> "$output_file"
-                    first=false
-                done
-                first=false
-            fi
-        fi
-    done
+policies_dir, output_file = sys.argv[1], sys.argv[2]
 
-    echo '  ]' >> "$output_file"
-    echo '}' >> "$output_file"
+statements = []
+for path in sorted(glob.glob(os.path.join(policies_dir, "*.json"))):
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    for stmt in doc.get("Statement", []):
+        statements.append(stmt)
+
+merged = {"Version": "2012-10-17", "Statement": statements}
+with open(output_file, "w", encoding="utf-8") as fh:
+    json.dump(merged, fh, indent=2)
+PY
+
+    if [ ! -s "$output_file" ]; then
+        log_error "Merged policy file is empty - aborting policy attach"
+        return 1
+    fi
 }
 
 # Main function
@@ -172,10 +169,21 @@ main() {
             fi
         done
 
-        # Merge all policy files into one
-        MERGED_POLICY_FILE="/tmp/merged_agent_policies_$$.json"
+        # Merge all policy files into one. Use a path in the current
+        # working directory rather than /tmp because on Git Bash /
+        # MINGW64 the POSIX `/tmp` path and Windows-native `%TEMP%`
+        # do not line up, and the AWS CLI (Windows binary) cannot
+        # read files the bash-side Python wrote under `/tmp`.
+        MERGED_POLICY_FILE="./.merged_agent_policies_$$.json"
         log "Merging policy files..."
-        merge_policies "$POLICIES_DIR" "$MERGED_POLICY_FILE"
+        if ! merge_policies "$POLICIES_DIR" "$MERGED_POLICY_FILE"; then
+            log_error "merge_policies failed; aborting"
+            exit 1
+        fi
+        if [ ! -s "$MERGED_POLICY_FILE" ]; then
+            log_error "Merged policy file missing or empty at $MERGED_POLICY_FILE"
+            exit 1
+        fi
         log_success "Policies merged successfully"
     fi
 
@@ -220,7 +228,9 @@ main() {
     attach_policy "$ROLE_NAME" "$POLICY_NAME" "$MERGED_POLICY_FILE"
 
     # Clean up temporary file if it was created
-    if [ "$MERGED_POLICY_FILE" != "agent_policies.json" ] && [ -f "$MERGED_POLICY_FILE" ]; then
+    if [ "$MERGED_POLICY_FILE" != "agent_policies.json" ] \
+        && [ "$MERGED_POLICY_FILE" != "./.merged_agent_policies_$$.json" ] \
+        || [ -f "$MERGED_POLICY_FILE" ]; then
         rm -f "$MERGED_POLICY_FILE"
         log "Cleaned up temporary merged policy file"
     fi

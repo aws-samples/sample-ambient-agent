@@ -1,0 +1,15 @@
+# Development and test dependencies for the backend.
+# Install with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# These are not bundled into any Lambda deployment asset.
+
+-r requirements.txt
+
+# Test runner for the contract test suite in tests/contracts.
+pytest>=8.0.0,<9.0.0
+
+# Powertools is normally provided by the Lambda managed layer, so we do
+# not ship it in requirements.txt. For local tests we need it explicitly
+# so `job_execution` and `signal_processor` modules can be imported.
+aws-lambda-powertools>=3.0.0,<4.0.0

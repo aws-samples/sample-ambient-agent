@@ -28,8 +28,9 @@ export interface Job {
   userId: string;
   agentId: string;
   jobName: string;
-  jobType: "user_initiated" | "scheduled";
+  jobType: "user_initiated" | "scheduled" | "signal_triggered";
   status: TaskStatus;
+
   sessionId: string;
   prompt: string;
   requiresAction: boolean;

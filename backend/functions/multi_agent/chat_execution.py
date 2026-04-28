@@ -26,6 +26,8 @@ from typing import Any, Dict, Optional
 
 import boto3
 from aws_lambda_powertools import Logger
+from botocore.exceptions import ClientError
+
 
 logger = Logger(service="chat-execution", level="INFO")
 
@@ -45,8 +47,10 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
     thread_id = event.get("threadId")
     session_id = event.get("sessionId")
     agent_id = event.get("agentId")
+    user_id = event.get("userId")
     user_message = event.get("message", "")
     is_human_response = bool(event.get("isHumanResponse"))
+
 
     if not (thread_id and session_id and agent_id):
         logger.error("Missing required event fields", extra={"event": event})
@@ -56,9 +60,10 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
         agent_response = agent_table.get_item(Key={"agentId": agent_id})
         if "Item" not in agent_response:
             _complete_thread_with_error(
-                thread_id, session_id, agent_id, "Agent not found"
+                thread_id, session_id, agent_id, "Agent not found", user_id=user_id
             )
             return {"statusCode": 404, "body": "Agent not found"}
+
 
         agent_arn = agent_response["Item"]["agentArn"]
 
@@ -107,8 +112,13 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
 
         # Append AI turn (the agent's reply, or its question if it interrupted)
         _append_conversation_turn(
-            session_id, agent_id, "ai", result_text or "(no response)"
+            session_id,
+            agent_id,
+            "ai",
+            result_text or "(no response)",
+            user_id=user_id,
         )
+
 
         new_status = "awaiting_human" if requires_human_input else "idle"
         _update_thread_status(
@@ -124,9 +134,14 @@ def handler(event: Dict[str, Any], _context: Any) -> Dict[str, Any]:
             extra={"threadId": thread_id, "error": str(exc)},
         )
         _complete_thread_with_error(
-            thread_id, session_id, agent_id, "Agent execution failed"
+            thread_id,
+            session_id,
+            agent_id,
+            "Agent execution failed",
+            user_id=user_id,
         )
         return {"statusCode": 500, "body": "Chat execution failed"}
+
 
 
 # ---------------------------------------------------------------------------
@@ -178,77 +193,113 @@ def _recent_history_text(session_id: str, limit: int = 10) -> str:
 # ---------------------------------------------------------------------------
 
 def _parse_agent_response(response: Dict[str, Any]) -> tuple[str, bool]:
-    """Return `(text, requires_human_input)` parsed from the AgentCore reply."""
-    result_text = ""
-    requires_human_input = False
+    """Parse the AgentCore reply into (text, requires_human_input).
 
-    if "response" in response:
-        body_bytes = response["response"].read()
-        try:
-            data = json.loads(body_bytes)
-        except (TypeError, ValueError):
-            return (body_bytes.decode("utf-8", errors="replace"), False)
+    Contract: the agent returns exactly one of
+        {"status": "completed",   "result": ...}
+        {"status": "interrupted", "question": ...}
+        {"status": "error",       "error":  ...}
+    """
+    if "response" not in response:
+        return "", False
 
-        if isinstance(data, dict):
-            status = data.get("status")
-            requires_human_input = bool(
-                data.get("requires_action") or data.get("requiresAction")
-            ) or status == "interrupted"
+    body_bytes = response["response"].read()
+    try:
+        data = json.loads(body_bytes)
+    except (TypeError, ValueError):
+        return body_bytes.decode("utf-8", errors="replace"), False
 
-            if "result" in data:
-                result = data["result"]
-                if isinstance(result, dict):
-                    result_text = (
-                        result.get("response", "")
-                        or result.get("output", "")
-                        or result.get("text", "")
-                        or result.get("answer", "")
-                        or str(result)
-                    )
-                else:
-                    result_text = str(result)
-            elif "output" in data:
-                out = data["output"]
-                if isinstance(out, dict):
-                    result_text = out.get("text", str(out))
-                else:
-                    result_text = str(out)
-            else:
-                result_text = str(data)
-        else:
-            result_text = str(data)
+    if not isinstance(data, dict):
+        return str(data), False
 
-    return result_text, requires_human_input
+    status = data.get("status")
+    if status == "interrupted":
+        question = (
+            data.get("question")
+            or data.get("human_input_question")
+            or data.get("result")
+            or ""
+        )
+        return str(question), True
+
+    if status == "error":
+        return str(data.get("error") or data.get("result") or "Agent error"), False
+
+    # Default: treat anything else as completed text.
+    result = data.get("result", "")
+    if isinstance(result, dict):
+        return (
+            result.get("response", "")
+            or result.get("output", "")
+            or result.get("text", "")
+            or result.get("answer", "")
+            or str(result)
+        ), False
+    return str(result), False
+
 
 
 # ---------------------------------------------------------------------------
 # DynamoDB helpers
 # ---------------------------------------------------------------------------
 
-def _append_conversation_turn(
-    session_id: str, agent_id: str, msg_type: str, content: str
+def _ensure_conversation_exists(
+    session_id: str, agent_id: str, user_id: Optional[str] = None
 ) -> None:
-    now = datetime.utcnow().isoformat()
-    resp = conversation_table.get_item(Key={"sessionId": session_id})
-    if "Item" in resp:
-        conversation = resp["Item"]
-        messages = conversation.get("messages", [])
-    else:
-        conversation = {
-            "sessionId": session_id,
-            "agentId": agent_id,
-            "createdAt": now,
-            "messages": [],
-        }
-        messages = []
+    """Create the conversation item if it does not exist.
 
-    messages.append({"type": msg_type, "content": content, "timestamp": now})
-    conversation["messages"] = messages
-    conversation["updatedAt"] = now
-    conversation["ttl"] = int(
-        (datetime.utcnow() + timedelta(days=30)).timestamp()
+    Conditional put so concurrent writers do not overwrite each other.
+    """
+    now = datetime.utcnow().isoformat()
+    ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+    item: Dict[str, Any] = {
+        "sessionId": session_id,
+        "agentId": agent_id,
+        "createdAt": now,
+        "updatedAt": now,
+        "messages": [],
+        "ttl": ttl,
+    }
+    if user_id:
+        item["userId"] = user_id
+    try:
+        conversation_table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(sessionId)",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+
+def _append_conversation_turn(
+    session_id: str,
+    agent_id: str,
+    msg_type: str,
+    content: str,
+    user_id: Optional[str] = None,
+) -> None:
+    """Append a single turn to the conversation using atomic list_append."""
+    _ensure_conversation_exists(session_id, agent_id, user_id)
+
+    now = datetime.utcnow().isoformat()
+    ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+    conversation_table.update_item(
+        Key={"sessionId": session_id},
+        UpdateExpression=(
+            "SET messages = list_append(if_not_exists(messages, :empty), :turn), "
+            "updatedAt = :now, "
+            "#ttl = :ttl"
+        ),
+        ExpressionAttributeNames={"#ttl": "ttl"},
+        ExpressionAttributeValues={
+            ":empty": [],
+            ":turn": [{"type": msg_type, "content": content, "timestamp": now}],
+            ":now": now,
+            ":ttl": ttl,
+        },
     )
-    conversation_table.put_item(Item=conversation)
+
 
 
 def _update_thread_status(thread_id: str, status: str, preview: str = "") -> None:
@@ -267,12 +318,19 @@ def _update_thread_status(thread_id: str, status: str, preview: str = "") -> Non
 
 
 def _complete_thread_with_error(
-    thread_id: str, session_id: str, agent_id: str, message: str
+    thread_id: str,
+    session_id: str,
+    agent_id: str,
+    message: str,
+    user_id: Optional[str] = None,
 ) -> None:
     try:
-        _append_conversation_turn(session_id, agent_id, "ai", f"Error: {message}")
+        _append_conversation_turn(
+            session_id, agent_id, "ai", f"Error: {message}", user_id=user_id
+        )
     finally:
         _update_thread_status(thread_id, "idle", preview=f"Error: {message}")
+
 
 
 # ---------------------------------------------------------------------------

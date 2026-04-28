@@ -1,5 +1,6 @@
 # Other
 node_modules
+blog
 
 # CDK asset staging directory
 .cdk.staging
@@ -30,6 +31,10 @@ config.yml
 .bedrock_agentcore/
 .config
 .env.bak
+
+# Agent Config
+
+agent/config.yaml
 
 # DevSecOps - Generated files (safe to ignore)
 ferret-sast-report.json

@@ -17,6 +17,23 @@ agent:
 execution:
   search_cooldown_seconds: 1
 
+  # Loop detector: short-circuits when the same action signature repeats
+  # more than `max_identical_actions` times within the sliding window.
+  loop_detector:
+    max_identical_actions: 3
+    window_size: 10
+
+  # Circuit breaker for identical queries fired back-to-back.
+  circuit_breaker:
+    max_calls: 2
+    cooldown_seconds: 1
+
+  # Bound the per-session state caches inside the agent container.
+  session_cache:
+    max_sessions: 200
+    ttl_seconds: 3600
+
+
 # Tool Configuration
 # Enable/disable tools and customize their behavior
 tools:
@@ -60,41 +77,21 @@ tools:
       This tool is particularly useful for processing files uploaded via S3 signals.
 
 # Prompts Configuration
+#
+# This is the system prompt passed to the tool-calling agent created via
+# `langchain.agents.create_agent`. Keep this prompt as plain guidance.
+
 prompts:
   system_template: |
-    You are a helpful AI assistant with access to various tools.
+    You are a helpful AI assistant with access to a set of tools.
 
-    AVAILABLE TOOLS:
-    {tools}
-
-    TOOL NAMES: {tool_names}
-
-    Use this format:
-
-    Thought: Think about what you need to do
-    Action: tool_name
-    Action Input: the input for the tool
-    Observation: the result from the tool
-    ... (repeat Thought/Action/Action Input/Observation as needed)
-    Thought: I now know the final answer
-    Final Answer: the final answer to the original question
-
-    If you can answer directly without using tools, use this format:
-
-    Thought: I can answer this directly
-    Final Answer: your response here
-
-    IMPORTANT GUIDELINES:
-    - For simple greetings or questions you can answer directly, skip tools and go straight to Final Answer
-    - For calculations, use the calculator tool
-    - If you need clarification, use the ask_human tool
-    - For S3 files, first use list_s3_files to verify the file exists, then use read_s3_file to read it
-    - When processing S3 signal events, always list files first to confirm the upload before reading
-    - Always use the exact format above - never respond without "Thought:" and "Final Answer:"
-
-    CONVERSATION HISTORY:
-    {chat_history}
-
-    Current question: {input}
-
-    {agent_scratchpad}
+    Guidelines:
+    - For simple greetings or questions you can answer directly, reply without
+      calling any tools.
+    - For mathematical calculations, call the calculator tool.
+    - If the user's request is ambiguous or you need a decision from the user,
+      call the ask_human tool with a clear, specific question.
+    - For S3 files, first use list_s3_files to confirm the file exists, then
+      use read_s3_file to read it. When processing S3 signal events, always
+      list the files before reading.
+    - Keep answers concise and grounded in tool results when tools are used.

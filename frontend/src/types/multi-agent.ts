@@ -28,8 +28,9 @@ export interface Job {
   userId: string;
   agentId: string;
   jobName: string;
-  jobType: "user_initiated" | "scheduled";
+  jobType: "user_initiated" | "scheduled" | "signal_triggered";
   status: TaskStatus;
+
   sessionId: string;
   prompt: string;
   requiresAction: boolean;
@@ -259,4 +260,49 @@ export interface SignalFormData {
   description: string;
   configuration: SignalConfiguration;
   enabled: boolean;
+}
+
+// -----------------------------------------------------------------------
+// Chat Types
+//
+// A "chat thread" is a free-form conversation with a registered agent,
+// independent from the Jobs workflow. Threads own metadata only; messages
+// live in the shared conversation-store table keyed by sessionId, so the
+// existing /conversations/{sessionId} GET endpoint serves chat history too.
+// -----------------------------------------------------------------------
+
+export type ChatThreadStatus = "idle" | "busy" | "awaiting_human";
+
+export interface ChatThread {
+  threadId: string;
+  userId: string;
+  agentId: string;
+  agentName: string;
+  title: string;
+  sessionId: string;
+  status: ChatThreadStatus;
+  lastMessagePreview?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateChatThreadRequest {
+  agentId: string;
+  title?: string;
+}
+
+export interface SendChatMessageRequest {
+  message: string;
+}
+
+export interface ListChatThreadsResponse {
+  threads: ChatThread[];
+  total: number;
+}
+
+export interface SendChatMessageResponse {
+  threadId: string;
+  sessionId: string;
+  status: ChatThreadStatus;
+  message: string;
 }

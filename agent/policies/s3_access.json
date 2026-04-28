@@ -4,17 +4,36 @@
     {
       "Sid": "S3ReadAccess",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
       "Resource": [
-        "arn:aws:s3:::${AGENT_BUCKET_NAME}",
-        "arn:aws:s3:::${AGENT_BUCKET_NAME}/*"
-      ]
+        "arn:aws:s3:::*",
+        "arn:aws:s3:::*/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:ResourceAccount": "${aws:PrincipalAccount}"
+        }
+      }
     },
     {
       "Sid": "S3WriteAccess",
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:DeleteObject"],
-      "Resource": ["arn:aws:s3:::${AGENT_BUCKET_NAME}/*"]
+      "Action": [
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::*/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:ResourceAccount": "${aws:PrincipalAccount}"
+        }
+      }
     }
   ]
 }

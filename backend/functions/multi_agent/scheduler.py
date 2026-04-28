@@ -7,17 +7,15 @@ from datetime import datetime
 from typing import Dict, Any, List
 from aws_lambda_powertools import Logger
 
-# Configure logging
 logger = Logger(service="scheduler", level="INFO")
 
-# Initialize AWS clients
 dynamodb = boto3.resource("dynamodb")
-lambda_client = boto3.client("lambda")
+sqs_client = boto3.client("sqs")
 
-# Environment variables
 TASK_REGISTRY_TABLE = os.environ["TASK_REGISTRY_TABLE"]
-TASK_EXECUTION_FUNCTION_NAME = os.environ["TASK_EXECUTION_FUNCTION_NAME"]
+JOB_EXECUTION_QUEUE_URL = os.environ.get("JOB_EXECUTION_QUEUE_URL", "")
 REGION = os.environ["REGION"]
+
 
 # Get DynamoDB table
 task_table = dynamodb.Table(TASK_REGISTRY_TABLE)
@@ -108,18 +106,22 @@ def process_due_task(job: Dict[str, Any], current_time: str) -> Dict[str, Any]:
         # Update job status to prevent duplicate execution
         update_task_status(job_id, "scheduled_for_execution")
 
-        # Invoke the job execution function asynchronously
-        payload = {
-            "jobId": job_id,
-            "scheduledExecution": True,
-            "scheduledAt": current_time,
-        }
+        if not JOB_EXECUTION_QUEUE_URL:
+            raise RuntimeError("JOB_EXECUTION_QUEUE_URL not configured")
 
-        response = lambda_client.invoke(
-            FunctionName=TASK_EXECUTION_FUNCTION_NAME,
-            InvocationType="Event",  # Asynchronous invocation
-            Payload=json.dumps(payload),
+        # Enqueue onto the job execution queue; the worker Lambda drains it.
+        message_body = json.dumps(
+            {
+                "jobId": job_id,
+                "scheduledExecution": True,
+                "scheduledAt": current_time,
+            }
         )
+        response = sqs_client.send_message(
+            QueueUrl=JOB_EXECUTION_QUEUE_URL,
+            MessageBody=message_body,
+        )
+
 
         # Update next run time for recurring jobs
         schedule = job.get("schedule", {})
@@ -144,8 +146,9 @@ def process_due_task(job: Dict[str, Any], current_time: str) -> Dict[str, Any]:
         return {
             "jobId": job_id,
             "status": "scheduled",
-            "invokeResponse": response["StatusCode"],
+            "messageId": response.get("MessageId"),
         }
+
 
     except Exception as e:
         logger.error("Error processing job", extra={"job_id": job_id, "error": str(e)})

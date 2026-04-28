@@ -3,9 +3,11 @@
 import json
 import boto3
 import os
-from datetime import datetime
-from typing import Dict, Any
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 from aws_lambda_powertools import Logger
+from botocore.exceptions import ClientError
+
 
 # Configure logging
 logger = Logger(service="conversation-management", level="INFO")
@@ -196,10 +198,34 @@ def get_conversation_context(
         return create_response(500, {"error": "Failed to get conversation context"})
 
 
+def _ensure_conversation_exists(
+    session_id: str, agent_id: Optional[str], user_id: str
+) -> None:
+    """Create the conversation item if it does not exist (conditional put)."""
+    now = datetime.utcnow().isoformat()
+    ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+    try:
+        conversation_table.put_item(
+            Item={
+                "sessionId": session_id,
+                "agentId": agent_id,
+                "userId": user_id,
+                "messages": [],
+                "createdAt": now,
+                "updatedAt": now,
+                "ttl": ttl,
+            },
+            ConditionExpression="attribute_not_exists(sessionId)",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+
+
 def add_conversation_message(
     session_id: str, user_id: str, body: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Add a message to the conversation"""
+    """Append a message to the conversation using atomic list_append."""
     try:
         message_type = body.get("type")  # 'human' or 'ai'
         content = body.get("content")
@@ -211,56 +237,43 @@ def add_conversation_message(
         if message_type not in ["human", "ai"]:
             return create_response(400, {"error": "Message type must be human or ai"})
 
-        # Verify user access
         if not verify_user_access_to_session(user_id, session_id):
             return create_response(403, {"error": "Access denied"})
 
-        # Get existing conversation or create new one
-        response = conversation_table.get_item(Key={"sessionId": session_id})
+        _ensure_conversation_exists(session_id, agent_id, user_id)
 
-        if "Item" in response:
-            conversation = response["Item"]
-            messages = conversation.get("messages", [])
-        else:
-            # Create new conversation
-            now = datetime.utcnow().isoformat()
-            conversation = {
-                "sessionId": session_id,
-                "agentId": agent_id,
-                "userId": user_id,
-                "messages": [],
-                "createdAt": now,
-                "updatedAt": now,
-            }
-            messages = []
-
-        # Add new message
+        now = datetime.utcnow().isoformat()
+        ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
         new_message = {
             "type": message_type,
             "content": content,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": now,
         }
 
-        messages.append(new_message)
+        result = conversation_table.update_item(
+            Key={"sessionId": session_id},
+            UpdateExpression=(
+                "SET messages = list_append(if_not_exists(messages, :empty), :turn), "
+                "updatedAt = :now, "
+                "#ttl = :ttl"
+            ),
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":empty": [],
+                ":turn": [new_message],
+                ":now": now,
+                ":ttl": ttl,
+            },
+            ReturnValues="UPDATED_NEW",
+        )
 
-        # Update conversation
-        conversation["messages"] = messages
-        conversation["updatedAt"] = datetime.utcnow().isoformat()
-
-        # Set TTL (30 days from now)
-        from datetime import timedelta
-
-        ttl = int((datetime.utcnow() + timedelta(days=30)).timestamp())
-        conversation["ttl"] = ttl
-
-        # Save to DynamoDB
-        conversation_table.put_item(Item=conversation)
+        message_count = len(result.get("Attributes", {}).get("messages", []))
 
         return create_response(
             200,
             {
                 "message": "Message added successfully",
-                "messageCount": len(messages),
+                "messageCount": message_count,
                 "sessionId": session_id,
             },
         )
@@ -274,26 +287,33 @@ def add_conversation_message(
         return create_response(500, {"error": "Failed to add message"})
 
 
+
 def verify_user_access_to_session(user_id: str, session_id: str) -> bool:
-    """Verify that the user has access to this session (fail-closed)"""
+    """Verify that the user has access to this session (fail-closed).
+
+    The conversation-store record itself carries `userId` (populated at
+    creation time by any of the write paths), so a single get_item is
+    sufficient. This avoids the O(N) scans the earlier implementation
+    issued against the jobs and chat-threads tables.
+    """
     try:
-        task_table = dynamodb.Table(os.environ["TASK_REGISTRY_TABLE"])
-
-        response = task_table.scan(
-            FilterExpression="sessionId = :session_id AND userId = :user_id",
-            ExpressionAttributeValues={
-                ":session_id": session_id,
-                ":user_id": user_id,
-            },
+        resp = conversation_table.get_item(
+            Key={"sessionId": session_id},
+            AttributesToGet=["userId"],
         )
-
-        return bool(response.get("Items"))
-
+        item = resp.get("Item")
+        if not item:
+            return False
+        owner = item.get("userId")
+        if owner and owner == user_id:
+            return True
+        return False
     except Exception as e:
         logger.error(
             "User access verification failed", extra={"error": str(e)}, exc_info=True
         )
         return False  # Deny access on error (fail-closed)
+
 
 
 def create_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:

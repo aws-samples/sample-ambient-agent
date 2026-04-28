@@ -11,11 +11,22 @@ import boto3
 import uuid
 import os
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from aws_lambda_powertools import Logger
+from aws_lambda_powertools.metrics import MetricUnit, Metrics
+from aws_lambda_powertools.utilities.idempotency import (
+    DynamoDBPersistenceLayer,
+    IdempotencyConfig,
+    idempotent_function,
+)
+from boto3.dynamodb.conditions import Key
+
+
 
 # Configure logging
 logger = Logger(service="signal-processor", level="INFO")
+metrics = Metrics(namespace="AmbientAgents", service="signal-processor")
+
 
 # Initialize AWS clients
 dynamodb = boto3.resource("dynamodb")
@@ -26,6 +37,23 @@ SIGNALS_TABLE = os.environ.get("AMBIENT_SIGNALS_TABLE")
 TASK_REGISTRY_TABLE = os.environ.get("TASK_REGISTRY_TABLE")
 TASK_EXECUTION_FUNCTION = os.environ.get("TASK_EXECUTION_FUNCTION_NAME")
 REGION = os.environ.get("REGION", "us-east-1")
+IDEMPOTENCY_TABLE = os.environ.get("IDEMPOTENCY_TABLE", "")
+
+
+# Powertools idempotency persistence layer. Keyed on
+# `(signalId, bucket, key, eventName, eTag)` so an S3 retry of the same
+# notification cannot create duplicate jobs. The idempotency table has a
+# TTL so stored keys expire after the configured window.
+_idempotency_layer: Optional[DynamoDBPersistenceLayer] = None
+if IDEMPOTENCY_TABLE:
+    _idempotency_layer = DynamoDBPersistenceLayer(table_name=IDEMPOTENCY_TABLE)
+
+_idempotency_config = IdempotencyConfig(
+    event_key_jmespath="idempotency_key",
+    expires_after_seconds=3600,
+    raise_on_no_idempotency_key=False,
+    use_local_cache=True,
+)
 
 
 def process_s3_signal(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -65,25 +93,41 @@ def process_s3_signal(event: Dict[str, Any]) -> Dict[str, Any]:
                 },
             )
 
-            # Find matching signals for this bucket and key
+            # Find matching signals for this bucket and key via the
+            # bucketName-signalId GSI. Keeps latency flat as the signals
+            # table grows; the old scan was O(tableSize).
             signals_table = dynamodb.Table(SIGNALS_TABLE)
 
-            # Scan for enabled S3 signals matching this bucket, scoped by bucket name
-            response = signals_table.scan(
-                FilterExpression="signalType = :type AND enabled = :enabled AND configuration.bucketName = :bucket",
+            response = signals_table.query(
+                IndexName="bucketName-signalId-index",
+                KeyConditionExpression=Key("bucketName").eq(bucket_name),
+                FilterExpression=(
+                    "signalType = :type AND enabled = :enabled"
+                ),
                 ExpressionAttributeValues={
                     ":type": "s3_file_upload",
                     ":enabled": True,
-                    ":bucket": bucket_name,
                 },
             )
 
             matching_signals = []
             for signal in response.get("Items", []):
+
                 config = signal.get("configuration", {})
                 signal_bucket = config.get("bucketName")
                 signal_prefix = config.get("prefix", "")
                 signal_suffix = config.get("suffix", "")
+
+                # Defensive strip: pre-refactor signal rows may carry
+                # trailing whitespace. S3 event payloads never do, so
+                # without this trim the equality check below would miss
+                # legitimate matches.
+                if isinstance(signal_bucket, str):
+                    signal_bucket = signal_bucket.strip()
+                if isinstance(signal_prefix, str):
+                    signal_prefix = signal_prefix.strip()
+                if isinstance(signal_suffix, str):
+                    signal_suffix = signal_suffix.strip()
 
                 # Check if this signal matches the event
                 if signal_bucket == bucket_name:
@@ -107,6 +151,13 @@ def process_s3_signal(event: Dict[str, Any]) -> Dict[str, Any]:
                     "key": object_key,
                 },
             )
+            if matching_signals:
+                metrics.add_metric(
+                    name="SignalMatched",
+                    unit=MetricUnit.Count,
+                    value=len(matching_signals),
+                )
+
 
             # Process each matching signal
             for signal in matching_signals:
@@ -152,10 +203,10 @@ def process_s3_signal(event: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def create_task_for_signal(
+def _create_task_for_signal_impl(
     signal: Dict[str, Any], payload: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Create a job for a triggered signal"""
+    """Create a job for a triggered signal (non-idempotent core)."""
     try:
         job_id = str(uuid.uuid4())
         session_id = str(uuid.uuid4())
@@ -186,7 +237,7 @@ Please analyze this file upload event and provide a summary or take appropriate 
             "userId": signal["userId"],
             "agentId": signal["agentId"],
             "jobName": f"Signal: {signal['signalName']} - {payload.get('key', 'Event')}",
-            "jobType": "user_initiated",  # Signal-triggered jobs are treated as user-initiated
+            "jobType": "signal_triggered",
             "status": "idle",
             "sessionId": session_id,
             "prompt": prompt,
@@ -199,6 +250,7 @@ Please analyze this file upload event and provide a summary or take appropriate 
                 "triggerPayload": payload,
             },
         }
+
 
         # Store job in DynamoDB
         task_table = dynamodb.Table(TASK_REGISTRY_TABLE)
@@ -222,6 +274,54 @@ Please analyze this file upload event and provide a summary or take appropriate 
         raise
 
 
+def create_task_for_signal(
+    signal: Dict[str, Any], payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Idempotent wrapper around `_create_task_for_signal_impl`.
+
+    When the idempotency table is configured, duplicate deliveries of the
+    same S3 event are suppressed: Powertools returns the stored result
+    of the first run instead of creating a second job. Without the table
+    (local/dev), the call falls through unchanged.
+
+    Key composition: `signalId + bucket + key + eventName + eTag +
+    eventTime`. Including `eventTime` means two separate uploads of the
+    same file (identical contents → same eTag) still produce two jobs
+    because S3 stamps a distinct `eventTime` on each delivery. Only a
+    literal retry of the same delivery (S3 retrying notification for
+    durability) shares the same `eventTime` and gets deduped.
+    """
+    if _idempotency_layer is None:
+        return _create_task_for_signal_impl(signal, payload)
+
+    signal_id = signal.get("signalId", "unknown")
+    bucket = payload.get("bucket", "")
+    key = payload.get("key", "")
+    event_name = payload.get("eventName", "")
+    etag = payload.get("eTag", "")
+    event_time = payload.get("eventTime", "")
+    idempotency_key = (
+        f"signal:{signal_id}:{bucket}:{key}:"
+        f"{event_name}:{etag}:{event_time}"
+    )
+
+    @idempotent_function(
+        data_keyword_argument="request",
+        persistence_store=_idempotency_layer,
+        config=_idempotency_config,
+    )
+    def _idempotent(request: Dict[str, Any]) -> Dict[str, Any]:
+        return _create_task_for_signal_impl(request["signal"], request["payload"])
+
+    return _idempotent(
+        request={
+            "idempotency_key": idempotency_key,
+            "signal": signal,
+            "payload": payload,
+        }
+    )
+
+
 def update_signal_stats(signal_id: str) -> None:
     """Update signal trigger statistics"""
     try:
@@ -243,9 +343,11 @@ def update_signal_stats(signal_id: str) -> None:
         )
 
 
+@metrics.log_metrics(capture_cold_start_metric=True)
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Main Lambda handler for signal processing"""
     try:
+
         logger.info(
             "Signal processing event received",
             extra={"event": json.dumps(event, default=str)},

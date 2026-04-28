@@ -10,17 +10,20 @@ from aws_cdk import (
     CfnOutput,
     aws_dynamodb as dynamodb,
     aws_lambda as _lambda,
+    aws_lambda_event_sources as lambda_event_sources,
     aws_apigateway as apigateway,
     aws_iam as iam,
     aws_logs as logs,
     aws_events as events,
     aws_events_targets as targets,
+    aws_sqs as sqs,
     aws_ssm as ssm,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
 )
+
 from cdk_nag import NagSuppressions
 from .config import AppConfig
 
@@ -64,6 +67,8 @@ class MultiAgentStack(Stack):
         self.task_registry_table = self._create_task_registry_table()
         self.conversation_store_table = self._create_conversation_store_table()
         self.ambient_signals_table = self._create_ambient_signals_table()
+        self.chat_threads_table = self._create_chat_threads_table()
+        self.idempotency_table = self._create_idempotency_table()
 
         # Create Lambda Powertools layer reference
         self.powertools_layer = _lambda.LayerVersion.from_layer_version_arn(
@@ -72,16 +77,61 @@ class MultiAgentStack(Stack):
             f"arn:aws:lambda:{self.region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:7",
         )
 
+        # Create SQS queue + DLQ that decouples job execution from the
+        # synchronous API Gateway call. The API handler enqueues, the
+        # worker Lambda drains.
+        # `enforce_ssl=True` attaches a queue policy that denies any
+        # request not using TLS (the aws:SecureTransport condition),
+        # satisfying AwsSolutions-SQS4.
+        self.job_execution_dlq = sqs.Queue(
+            self,
+            f"{self.config.stack_name}-JobExecutionDLQ",
+            queue_name=f"{self.config.stack_name}-job-execution-dlq",
+            retention_period=Duration.days(14),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+        )
+        self.job_execution_queue = sqs.Queue(
+            self,
+            f"{self.config.stack_name}-JobExecutionQueue",
+            queue_name=f"{self.config.stack_name}-job-execution-queue",
+            # Must exceed the worker Lambda timeout; AgentCore runs can
+            # legitimately take up to 10 minutes.
+            visibility_timeout=Duration.minutes(15),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+            dead_letter_queue=sqs.DeadLetterQueue(
+                max_receive_count=3,
+                queue=self.job_execution_dlq,
+            ),
+        )
+
+        # DLQ for functions that are invoked asynchronously (Event
+        # invocation) so we do not drop work silently on failure.
+        self.async_invoke_dlq = sqs.Queue(
+            self,
+            f"{self.config.stack_name}-AsyncInvokeDLQ",
+            queue_name=f"{self.config.stack_name}-async-invoke-dlq",
+            retention_period=Duration.days(14),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+        )
+
         # Create Lambda functions
         self.agent_management_function = self._create_agent_management_function()
         self.task_management_function = self._create_task_management_function()
         self.task_execution_function = self._create_task_execution_function()
         self.scheduler_function = self._create_scheduler_function()
+
         self.conversation_management_function = (
             self._create_conversation_management_function()
         )
         self.signal_management_function = self._create_signal_management_function()
         self.signal_processor_function = self._create_signal_processor_function()
+        # Chat execution must be built before chat management so the latter
+        # can reference its ARN for async invocation.
+        self.chat_execution_function = self._create_chat_execution_function()
+        self.chat_management_function = self._create_chat_management_function()
 
         # Create API Gateway resources
         self.api_gateway = self._create_api_gateway()
@@ -98,6 +148,8 @@ class MultiAgentStack(Stack):
             self.conversation_management_function,
             self.signal_management_function,
             self.signal_processor_function,
+            self.chat_management_function,
+            self.chat_execution_function,
         ]:
             fn.add_environment("ALLOWED_ORIGIN", allowed_origin)
 
@@ -269,7 +321,7 @@ class MultiAgentStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # GSI for user-based signal queries (essential for the UI)
+        # GSI for user-based signal queries (used by the UI list page).
         table.add_global_secondary_index(
             index_name="userId-signalName-index",
             partition_key=dynamodb.Attribute(
@@ -280,7 +332,45 @@ class MultiAgentStack(Stack):
             ),
         )
 
+        # GSI that the signal processor queries on every S3 event. The
+        # partition key is a top-level `bucketName` attribute (GSI keys
+        # cannot be nested, so signal_management copies bucketName out of
+        # configuration when it writes the item).
+        table.add_global_secondary_index(
+            index_name="bucketName-signalId-index",
+            partition_key=dynamodb.Attribute(
+                name="bucketName", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="signalId", type=dynamodb.AttributeType.STRING
+            ),
+        )
+
         return table
+
+    def _create_idempotency_table(self) -> dynamodb.Table:
+        """Create DynamoDB table for Powertools idempotency records.
+
+        Shape follows `aws_lambda_powertools.utilities.idempotency.persistence`:
+        partition key `id` (string), TTL attribute `expiration` (number).
+        Keeps duplicate-suppression records from growing unboundedly - old
+        entries expire automatically after the configured idempotency
+        window on each lambda.
+        """
+        return dynamodb.Table(
+            self,
+            f"{self.config.stack_name}-IdempotencyTable",
+            table_name=f"{self.config.stack_name}-idempotency-records",
+            partition_key=dynamodb.Attribute(
+                name="id", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.AWS_MANAGED,
+            point_in_time_recovery=True,
+            time_to_live_attribute="expiration",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
 
     def _create_agent_management_function(self) -> _lambda.Function:
         """Create Lambda function for agent management"""
@@ -409,7 +499,14 @@ class MultiAgentStack(Stack):
             )
         )
 
-        # Grant Bedrock Agent Core permissions
+        # Grant Bedrock Agent Core permissions.
+        # The agent registry stores full ARNs from whatever region the user
+        # deployed the AgentCore runtime in (e.g., us-east-1), which may
+        # differ from this stack's region. Use a region wildcard so the
+        # Lambda can invoke runtimes registered from any region in this
+        # account. InvokeAgentRuntime authorizes against both the runtime
+        # resource and the runtime-endpoint resource, so both patterns are
+        # granted.
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
@@ -417,24 +514,19 @@ class MultiAgentStack(Stack):
                     "bedrock-agentcore:InvokeAgentRuntime",
                 ],
                 resources=[
-                    f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:runtime/*",
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
                 ],
             )
         )
 
-        # Grant permission for the function to invoke itself (for async execution)
-        # Using wildcard to avoid circular dependency
-        lambda_role.add_to_policy(
-            iam.PolicyStatement(
-                effect=iam.Effect.ALLOW,
-                actions=["lambda:InvokeFunction"],
-                resources=[
-                    f"arn:aws:lambda:{self.region}:{self.account}:function:{
-                        self.config.stack_name
-                    }-job-execution"
-                ],
-            )
-        )
+        # Grant the worker Lambda permission to consume job-execution
+        # messages from the queue.
+        self.job_execution_queue.grant_consume_messages(lambda_role)
+
+        # Idempotency: lets the API path suppress duplicate enqueues for
+        # the same (jobId, humanResponse) within a short window.
+        self.idempotency_table.grant_read_write_data(lambda_role)
 
         function = _lambda.Function(
             self,
@@ -451,11 +543,31 @@ class MultiAgentStack(Stack):
                 "TASK_REGISTRY_TABLE": self.task_registry_table.table_name,
                 "CONVERSATION_STORE_TABLE": self.conversation_store_table.table_name,
                 "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
+                "JOB_EXECUTION_QUEUE_URL": self.job_execution_queue.queue_url,
+                "IDEMPOTENCY_TABLE": self.idempotency_table.table_name,
                 "REGION": self.region,
             },
+            # Cap concurrent model invocations so a burst of signals
+            # cannot saturate the Bedrock quota. Tune via deploy config.
+            reserved_concurrent_executions=20,
         )
 
+        # Wire SQS as an event source for the same Lambda. API Gateway
+        # invocations still land here through the regular event path; SQS
+        # records are handled alongside via the Records envelope.
+        function.add_event_source(
+            lambda_event_sources.SqsEventSource(
+                self.job_execution_queue,
+                batch_size=1,
+                report_batch_item_failures=True,
+            )
+        )
+
+        # Allow the API-side of this Lambda to enqueue new work.
+        self.job_execution_queue.grant_send_messages(lambda_role)
+
         return function
+
 
     def _create_scheduler_function(self) -> _lambda.Function:
         """Create Lambda function for job scheduling"""
@@ -486,15 +598,19 @@ class MultiAgentStack(Stack):
             layers=[self.powertools_layer],
             environment={
                 "TASK_REGISTRY_TABLE": self.task_registry_table.table_name,
-                "TASK_EXECUTION_FUNCTION_NAME": f"{self.config.stack_name}-job-execution",
+                "JOB_EXECUTION_QUEUE_URL": self.job_execution_queue.queue_url,
                 "REGION": self.region,
             },
+            dead_letter_queue_enabled=True,
+            dead_letter_queue=self.async_invoke_dlq,
         )
 
-        # Grant permission to invoke job execution function
-        self.task_execution_function.grant_invoke(lambda_role)
+        # Scheduler enqueues into the job-execution queue instead of
+        # directly invoking the executor Lambda.
+        self.job_execution_queue.grant_send_messages(lambda_role)
 
         return function
+
 
     def _create_conversation_management_function(self) -> _lambda.Function:
         """Create Lambda function for conversation management"""
@@ -509,10 +625,14 @@ class MultiAgentStack(Stack):
             ],
         )
 
-        # Grant DynamoDB permissions
+        # Grant DynamoDB permissions. Conversation access is authorized by
+        # verifying ownership against either the jobs table (classic job flow)
+        # or the chat-threads table (standalone chat flow), so we need read
+        # access to both.
         self.conversation_store_table.grant_read_write_data(lambda_role)
         self.agent_registry_table.grant_read_data(lambda_role)
         self.task_registry_table.grant_read_data(lambda_role)
+        self.chat_threads_table.grant_read_data(lambda_role)
 
         function = _lambda.Function(
             self,
@@ -529,6 +649,7 @@ class MultiAgentStack(Stack):
                 "CONVERSATION_STORE_TABLE": self.conversation_store_table.table_name,
                 "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
                 "TASK_REGISTRY_TABLE": self.task_registry_table.table_name,
+                "CHAT_THREADS_TABLE": self.chat_threads_table.table_name,
                 "REGION": self.region,
             },
         )
@@ -620,18 +741,9 @@ class MultiAgentStack(Stack):
         self.ambient_signals_table.grant_read_write_data(lambda_role)
         self.task_registry_table.grant_read_write_data(lambda_role)
 
-        # Grant Lambda invoke permissions for job execution
-        lambda_role.add_to_policy(
-            iam.PolicyStatement(
-                effect=iam.Effect.ALLOW,
-                actions=["lambda:InvokeFunction"],
-                resources=[
-                    f"arn:aws:lambda:{self.region}:{self.account}:function:{
-                        self.config.stack_name
-                    }-job-execution"
-                ],
-            )
-        )
+        # Idempotency: suppress duplicate S3 event deliveries by
+        # (signalId, bucket, key, eventName, eTag).
+        self.idempotency_table.grant_read_write_data(lambda_role)
 
         # Grant S3 read permissions to access uploaded files if needed
         lambda_role.add_to_policy(
@@ -659,16 +771,152 @@ class MultiAgentStack(Stack):
             environment={
                 "AMBIENT_SIGNALS_TABLE": self.ambient_signals_table.table_name,
                 "TASK_REGISTRY_TABLE": self.task_registry_table.table_name,
-                "TASK_EXECUTION_FUNCTION_NAME": f"{self.config.stack_name}-job-execution",
+                "IDEMPOTENCY_TABLE": self.idempotency_table.table_name,
                 "REGION": self.region,
             },
+            dead_letter_queue_enabled=True,
+            dead_letter_queue=self.async_invoke_dlq,
         )
+
 
         # Note: S3 bucket notification permissions are added dynamically by signal_management
         # when signals are created/updated, using the statement ID pattern:
         # s3-invoke-signal-{signalId}
 
         return function
+
+    def _create_chat_threads_table(self) -> dynamodb.Table:
+        """Create DynamoDB table for chat threads.
+
+        Rows carry thread metadata only. Messages live in the shared
+        conversation-store table keyed by sessionId, so they are not
+        duplicated here.
+        """
+        table = dynamodb.Table(
+            self,
+            f"{self.config.stack_name}-ChatThreadsTable",
+            table_name=f"{self.config.stack_name}-chat-threads",
+            partition_key=dynamodb.Attribute(
+                name="threadId", type=dynamodb.AttributeType.STRING
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            encryption=dynamodb.TableEncryption.AWS_MANAGED,
+            point_in_time_recovery=True,
+            time_to_live_attribute="ttl",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # GSI lets the chat UI list a user's threads sorted by recency.
+        table.add_global_secondary_index(
+            index_name="userId-updatedAt-index",
+            partition_key=dynamodb.Attribute(
+                name="userId", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="updatedAt", type=dynamodb.AttributeType.STRING
+            ),
+        )
+
+        return table
+
+    def _create_chat_execution_function(self) -> _lambda.Function:
+        """Create Lambda that performs the actual AgentCore call for a chat turn."""
+        lambda_role = iam.Role(
+            self,
+            f"{self.config.stack_name}-ChatExecutionRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                ),
+            ],
+        )
+
+        self.chat_threads_table.grant_read_write_data(lambda_role)
+        self.conversation_store_table.grant_read_write_data(lambda_role)
+        self.agent_registry_table.grant_read_data(lambda_role)
+
+        # Same region-wildcard policy as the job executor so chat can invoke
+        # AgentCore runtimes registered in any region of this account.
+        lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                effect=iam.Effect.ALLOW,
+                actions=["bedrock-agentcore:InvokeAgentRuntime"],
+                resources=[
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
+                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
+                ],
+            )
+        )
+
+        function = _lambda.Function(
+            self,
+            f"{self.config.stack_name}-ChatExecutionFunction",
+            function_name=f"{self.config.stack_name}-chat-execution",
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            handler="chat_execution.handler",
+            code=_lambda.Code.from_asset("functions/multi_agent"),
+            timeout=Duration.minutes(10),
+            memory_size=512,
+            role=lambda_role,
+            layers=[self.powertools_layer],
+            environment={
+                "CHAT_THREADS_TABLE": self.chat_threads_table.table_name,
+                "CONVERSATION_STORE_TABLE": self.conversation_store_table.table_name,
+                "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
+                "REGION": self.region,
+            },
+            dead_letter_queue_enabled=True,
+            dead_letter_queue=self.async_invoke_dlq,
+        )
+
+        return function
+
+    def _create_chat_management_function(self) -> _lambda.Function:
+
+        """Create the Lambda that handles /chats CRUD + message POSTs."""
+        lambda_role = iam.Role(
+            self,
+            f"{self.config.stack_name}-ChatManagementRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                ),
+            ],
+        )
+
+        self.chat_threads_table.grant_read_write_data(lambda_role)
+        self.conversation_store_table.grant_read_write_data(lambda_role)
+        self.agent_registry_table.grant_read_data(lambda_role)
+
+        # Allow async-invoking the chat executor for message turns.
+        self.chat_execution_function.grant_invoke(lambda_role)
+
+        function = _lambda.Function(
+            self,
+            f"{self.config.stack_name}-ChatManagementFunction",
+            function_name=f"{self.config.stack_name}-chat-management",
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            handler="chat_management.handler",
+            code=_lambda.Code.from_asset("functions/multi_agent"),
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            role=lambda_role,
+            layers=[self.powertools_layer],
+            environment={
+                "CHAT_THREADS_TABLE": self.chat_threads_table.table_name,
+                "CONVERSATION_STORE_TABLE": self.conversation_store_table.table_name,
+                "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
+                "CHAT_EXECUTION_FUNCTION_NAME": self.chat_execution_function.function_name,
+                "REGION": self.region,
+            },
+            dead_letter_queue_enabled=True,
+            dead_letter_queue=self.async_invoke_dlq,
+        )
+
+        return function
+
 
     def _create_api_gateway(self) -> apigateway.RestApi:
         """Create API Gateway for multi-agent platform"""
@@ -879,6 +1127,43 @@ class MultiAgentStack(Stack):
             authorizer=authorizer,
         )
 
+        # Chat routes - standalone agent chat decoupled from jobs.
+        chats_resource = api.root.add_resource("chats")
+        chats_resource.add_method(
+            "GET",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+        chats_resource.add_method(
+            "POST",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+
+        chat_thread_resource = chats_resource.add_resource("{threadId}")
+        chat_thread_resource.add_method(
+            "GET",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+        chat_thread_resource.add_method(
+            "DELETE",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+
+        chat_messages_resource = chat_thread_resource.add_resource("messages")
+        chat_messages_resource.add_method(
+            "POST",
+            apigateway.LambdaIntegration(self.chat_management_function),
+            authorization_type=apigateway.AuthorizationType.COGNITO,
+            authorizer=authorizer,
+        )
+
         return api
 
     def _add_cors_preflight(self, allowed_origin: str):
@@ -974,6 +1259,41 @@ class MultiAgentStack(Stack):
             ),
         )
 
+        # SPA routing: rewrite any extension-less request path to /index.html
+        # at the viewer-request stage of the default (S3) behavior. The
+        # function is scoped to the default behavior only so API responses
+        # on /prod/* pass through untouched.
+        spa_router_fn = cloudfront.Function(
+
+            self,
+            f"{self.config.stack_name}-SpaRouterFunction",
+            function_name=f"{self.config.stack_name}-spa-router",
+            comment=(
+                "Rewrites client-side React Router paths to /index.html so "
+                "deep links and page refreshes load the SPA shell."
+            ),
+            code=cloudfront.FunctionCode.from_inline(
+                """
+function handler(event) {
+    var request = event.request;
+    var uri = request.uri;
+    if (uri === '' || uri === '/') {
+        return request;
+    }
+    // Paths with a file extension are real assets; everything else is a
+    // React Router path and gets rewritten to the SPA shell.
+    var hasExtension = /\\.[a-zA-Z0-9]{1,8}$/.test(uri);
+    if (hasExtension) {
+        return request;
+    }
+    request.uri = '/index.html';
+    return request;
+}
+"""
+            ),
+        )
+
+
         distribution = cloudfront.Distribution(
             self,
             f"{self.config.stack_name}-Distribution",
@@ -985,6 +1305,12 @@ class MultiAgentStack(Stack):
                 compress=True,
                 cache_policy=default_cache_policy,
                 response_headers_policy=security_headers_policy,
+                function_associations=[
+                    cloudfront.FunctionAssociation(
+                        function=spa_router_fn,
+                        event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                    ),
+                ],
             ),
             additional_behaviors={
                 "/assets/*": cloudfront.BehaviorOptions(
@@ -1022,18 +1348,14 @@ class MultiAgentStack(Stack):
                     origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
                 ),
             },
-            error_responses=[
-                cloudfront.ErrorResponse(
-                    http_status=404,
-                    response_http_status=200,
-                    response_page_path="/index.html",
-                    ttl=Duration.seconds(0),
-                ),
-            ],
+            # SPA fallback is handled by spa_router_fn so API 404s on
+            # /prod/* pass through as genuine 404s.
             enable_ipv6=False,
+
             enable_logging=True,
             log_bucket=cloudfront_access_logs_bucket,
         )
+
 
         NagSuppressions.add_resource_suppressions(
             distribution,

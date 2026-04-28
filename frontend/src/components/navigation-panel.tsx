@@ -22,6 +22,11 @@ export default function NavigationPanel() {
       },
       {
         type: "link",
+        text: "Chat",
+        href: "/chat",
+      },
+      {
+        type: "link",
         text: "Agents",
         href: "/agents",
       },

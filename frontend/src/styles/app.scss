@@ -13,7 +13,12 @@ body {
   margin: 0;
   padding: 0;
   overflow-x: hidden;
+  // Reserve space for the vertical scrollbar so routes with different
+  // content heights don't produce a horizontal layout shift when
+  // navigating between them.
+  scrollbar-gutter: stable;
 }
+
 
 #root,
 div[data-amplify-authenticator],
@@ -28,6 +33,7 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
 }
+
 
 body.awsui-dark-mode {
   background-color: #0e1b2a;

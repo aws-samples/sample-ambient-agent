@@ -46,7 +46,11 @@ class InfrastructureStack(Stack):
                 require_digits=True,
                 require_symbols=True,
             ),
-            advanced_security_mode=cognito.AdvancedSecurityMode.ENFORCED,
+            # Use the Plus feature plan (replaces the deprecated
+            # advanced_security_mode property). Plus tier enables advanced
+            # security features such as adaptive authentication, compromised
+            # credential detection, and protection against unsafe passwords.
+            feature_plan=cognito.FeaturePlan.PLUS,
         )
 
         user_pool_client = user_pool.add_client(

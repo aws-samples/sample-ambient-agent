@@ -90,6 +90,19 @@ def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
         signal_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
+        configuration = body.get("configuration", {}) or {}
+
+        # Normalise bucket / prefix / suffix: S3 rejects bucket names
+        # with leading or trailing whitespace (its regex is strict and
+        # boto3 validates client-side), and downstream key-matching is
+        # simpler when prefix/suffix are trimmed. Strip before persist
+        # so future delete/update paths don't hit ParamValidationError
+        # on values pasted with stray whitespace.
+        for _key in ("bucketName", "prefix", "suffix"):
+            _val = configuration.get(_key)
+            if isinstance(_val, str):
+                configuration[_key] = _val.strip()
+
         signal_item = {
             "signalId": signal_id,
             "userId": user_id,
@@ -97,12 +110,19 @@ def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
             "signalType": body["signalType"],
             "agentId": body["agentId"],
             "description": body.get("description", ""),
-            "configuration": body.get("configuration", {}),
+            "configuration": configuration,
             "enabled": body.get("enabled", True),
             "triggerCount": 0,
             "createdAt": now,
             "updatedAt": now,
         }
+
+        # GSI keys cannot be nested, so mirror the bucket name to a
+        # top-level attribute. The signal processor queries on this.
+        bucket_name = configuration.get("bucketName")
+        if bucket_name:
+            signal_item["bucketName"] = bucket_name
+
 
         # Store in DynamoDB
         signals_table = dynamodb.Table(SIGNALS_TABLE)
@@ -302,8 +322,24 @@ def update_signal(event: Dict[str, Any]) -> Dict[str, Any]:
             expression_values[":description"] = body["description"]
 
         if "configuration" in body:
+            new_configuration = body["configuration"] or {}
+            # Same whitespace-strip normalisation as create_signal so
+            # S3 client calls don't fail validation later.
+            for _key in ("bucketName", "prefix", "suffix"):
+                _val = new_configuration.get(_key)
+                if isinstance(_val, str):
+                    new_configuration[_key] = _val.strip()
             update_expression += ", configuration = :configuration"
-            expression_values[":configuration"] = body["configuration"]
+            expression_values[":configuration"] = new_configuration
+            # Keep the top-level bucketName GSI key in sync with the
+            # configuration.bucketName attribute on every update.
+            new_bucket = new_configuration.get("bucketName")
+            if new_bucket:
+                update_expression += ", bucketName = :bucketName"
+                expression_values[":bucketName"] = new_bucket
+            else:
+                update_expression += " REMOVE bucketName"
+
 
         if "enabled" in body:
             update_expression += ", enabled = :enabled"
@@ -418,6 +454,16 @@ def create_s3_trigger(signal: Dict[str, Any]) -> None:
         prefix = configuration.get("prefix", "")
         suffix = configuration.get("suffix", "")
 
+        # Defence-in-depth: older signal rows may still carry trailing
+        # whitespace on any of these fields. Trim so boto3's strict
+        # bucket-name validator does not refuse the request.
+        if isinstance(bucket_name, str):
+            bucket_name = bucket_name.strip()
+        if isinstance(prefix, str):
+            prefix = prefix.strip()
+        if isinstance(suffix, str):
+            suffix = suffix.strip()
+
         if not bucket_name:
             logger.warning(f"No bucket name configured for signal {signal['signalId']}")
             return
@@ -426,23 +472,36 @@ def create_s3_trigger(signal: Dict[str, Any]) -> None:
             logger.error("SIGNAL_PROCESSOR_FUNCTION_NAME not set")
             return
 
-        # Get bucket region to ensure Lambda and bucket are in same region
+        # Look up the bucket's region for logging only (S3 bucket
+        # notifications can fire cross-region). The ARN we install must
+        # point at the Lambda's own region, which is this function's
+        # REGION env var.
         try:
             bucket_location = s3_client.get_bucket_location(Bucket=bucket_name)
-            bucket_region = bucket_location.get("LocationConstraint")
-            # Note: us-east-1 returns None for LocationConstraint
-            if bucket_region is None:
-                bucket_region = "us-east-1"
+            bucket_region = bucket_location.get("LocationConstraint") or "us-east-1"
         except ClientError as e:
-            logger.error(
-                "Bucket location retrieval failed",
-                extra={"error": str(e)},
-                exc_info=True,
+            logger.warning(
+                "Bucket location lookup failed (continuing)",
+                extra={"error": str(e), "bucket_name": bucket_name},
             )
-            return
+            bucket_region = "unknown"
 
-        # Get Lambda function ARN - use bucket's region
-        lambda_arn = f"arn:aws:lambda:{bucket_region}:{ACCOUNT_ID}:function:{SIGNAL_PROCESSOR_FUNCTION_NAME}"
+        # The signal-processor Lambda lives in the stack's region.
+        lambda_arn = (
+            f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:"
+            f"{SIGNAL_PROCESSOR_FUNCTION_NAME}"
+        )
+
+        if bucket_region != "unknown" and bucket_region != REGION:
+            logger.info(
+                "Bucket and Lambda are in different regions; S3 will "
+                "deliver events cross-region",
+                extra={
+                    "bucket_region": bucket_region,
+                    "lambda_region": REGION,
+                    "bucket_name": bucket_name,
+                },
+            )
 
         # Add Lambda permission for S3 to invoke the function
         statement_id = f"s3-invoke-signal-{signal['signalId']}"
@@ -489,32 +548,65 @@ def create_s3_trigger(signal: Dict[str, Any]) -> None:
         # Get existing Lambda configurations or initialize empty list
         lambda_configs = notification_config.get("LambdaFunctionConfigurations", [])
 
-        # Create new notification configuration for this signal
+        # Build the new rule we want to install.
+        own_id = f"signal-{signal['signalId']}"
         new_config = {
-            "Id": f"signal-{signal['signalId']}",
+            "Id": own_id,
             "LambdaFunctionArn": lambda_arn,
             "Events": ["s3:ObjectCreated:*"],
         }
-
-        # Add filter rules if prefix or suffix specified
         filter_rules = []
         if prefix:
             filter_rules.append({"Name": "prefix", "Value": prefix})
         if suffix:
             filter_rules.append({"Name": "suffix", "Value": suffix})
-
         if filter_rules:
             new_config["Filter"] = {"Key": {"FilterRules": filter_rules}}
 
-        # Remove any existing configuration for this signal (in case of update)
-        lambda_configs = [
-            c for c in lambda_configs if c.get("Id") != f"signal-{signal['signalId']}"
-        ]
+        # Drop any stale rule for this signal (upsert semantics).
+        lambda_configs = [c for c in lambda_configs if c.get("Id") != own_id]
 
-        # Add new configuration
+        # Purge orphan rules: any rule whose Id looks like `signal-<uuid>`
+        # but whose signal no longer exists in our DynamoDB table is dead
+        # wiring from a prior failed create. Leaving it around blocks new
+        # signals via the overlap check below.
+        lambda_configs = _drop_orphan_signal_rules(lambda_configs)
+
+        # S3 rejects PutBucketNotificationConfiguration when two rules on
+        # the same bucket + event-type have overlapping filters. If
+        # another LIVE signal already covers the same key-space on this
+        # bucket, skip installing a dedicated rule; the signal_processor
+        # will still fire via the existing broader rule and its in-code
+        # prefix/suffix re-check will keep behaviour correct.
+        conflicting = _find_conflicting_rule(
+            lambda_configs,
+            new_events=new_config["Events"],
+            new_prefix=prefix,
+            new_suffix=suffix,
+        )
+        if conflicting is not None:
+            logger.warning(
+                "S3 filter overlap with an existing live signal; "
+                "relying on that rule + in-code filter instead of "
+                "installing a dedicated rule for this signal",
+                extra={
+                    "signal_id": signal["signalId"],
+                    "bucket_name": bucket_name,
+                    "conflicting_rule_id": conflicting.get("Id"),
+                    "new_prefix": prefix or None,
+                    "new_suffix": suffix or None,
+                },
+            )
+            # Still write back any pruned orphan rules so the next create
+            # on this bucket starts from a clean state.
+            notification_config["LambdaFunctionConfigurations"] = lambda_configs
+            s3_client.put_bucket_notification_configuration(
+                Bucket=bucket_name, NotificationConfiguration=notification_config
+            )
+            return
+
+        # No conflict: install the dedicated rule.
         lambda_configs.append(new_config)
-
-        # Update bucket notification configuration
         notification_config["LambdaFunctionConfigurations"] = lambda_configs
 
         s3_client.put_bucket_notification_configuration(
@@ -530,21 +622,158 @@ def create_s3_trigger(signal: Dict[str, Any]) -> None:
         error_code = e.response["Error"]["Code"]
         if error_code == "AccessDenied":
             logger.error(
-                f"Access denied when configuring S3 bucket {bucket_name}. Ensure the Lambda has s3:PutBucketNotification permission."
+                "Access denied when configuring S3 bucket; "
+                "Lambda needs s3:PutBucketNotification on this bucket",
+                extra={"bucket_name": bucket_name, "signal_id": signal["signalId"]},
+            )
+        elif error_code == "InvalidArgument" and "Configurations overlap" in str(e):
+            # Defensive: we pre-check above, but S3 can still reject if
+            # the bucket state changed between our read and write.
+            logger.warning(
+                "S3 rejected notification config due to overlapping rule; "
+                "skipping dedicated rule for this signal",
+                extra={
+                    "bucket_name": bucket_name,
+                    "signal_id": signal["signalId"],
+                },
             )
         else:
             logger.error(
-                "S3 trigger creation failed", extra={"error": str(e)}, exc_info=True
+                "S3 trigger creation failed",
+                extra={"error": str(e), "signal_id": signal["signalId"]},
+                exc_info=True,
             )
     except Exception as e:
         logger.error(
-            "S3 trigger creation failed", extra={"error": str(e)}, exc_info=True
+            "S3 trigger creation failed",
+            extra={"error": str(e), "signal_id": signal["signalId"]},
+            exc_info=True,
         )
+
+
+def _drop_orphan_signal_rules(lambda_configs: list) -> list:
+    """Filter out notification rules whose signal is gone from DynamoDB.
+
+    A prior failed `create_signal` attempt (for instance, an S3 overlap
+    error before this change) can leave a notification rule on the
+    bucket whose companion DynamoDB row was rolled back or never
+    created. Those rules fire into a signal row that does not exist,
+    producing silent no-ops, and they also block new overlapping
+    signals via `_find_conflicting_rule`. Purging them before the
+    overlap check keeps the bucket's notification config truthful.
+    """
+    if not lambda_configs:
+        return lambda_configs
+
+    signals_table = dynamodb.Table(SIGNALS_TABLE)
+    kept: list = []
+    for rule in lambda_configs:
+        rule_id = rule.get("Id", "")
+        if not rule_id.startswith("signal-"):
+            # Not one of ours; leave it alone.
+            kept.append(rule)
+            continue
+        candidate_signal_id = rule_id[len("signal-") :]
+        try:
+            resp = signals_table.get_item(Key={"signalId": candidate_signal_id})
+        except ClientError as exc:
+            # If DynamoDB lookup fails we keep the rule (fail-safe).
+            logger.warning(
+                "Orphan check DynamoDB read failed; keeping rule",
+                extra={"rule_id": rule_id, "error": str(exc)},
+            )
+            kept.append(rule)
+            continue
+        if "Item" in resp:
+            kept.append(rule)
+        else:
+            logger.info(
+                "Dropping orphan S3 notification rule (signal not in DynamoDB)",
+                extra={"rule_id": rule_id},
+            )
+    return kept
+
+
+def _find_conflicting_rule(
+    lambda_configs: list,
+    new_events: list,
+    new_prefix: str,
+    new_suffix: str,
+) -> Optional[dict]:
+    """Return the first existing rule whose filter overlaps with ours.
+
+    S3's overlap rules, summarised:
+    - Two rules on the same event type with no filter both apply to every
+      object, so they overlap.
+    - A rule with no filter is a superset of any filtered rule on the same
+      event type.
+    - Prefix A overlaps prefix B if one is a string-prefix of the other.
+    - Suffix handling is analogous.
+    """
+    for rule in lambda_configs:
+        existing_events = set(rule.get("Events", []))
+        proposed_events = set(new_events)
+        if existing_events.isdisjoint(proposed_events):
+            continue
+
+        existing_prefix, existing_suffix = _extract_filter(rule)
+        if _filters_overlap(
+            existing_prefix, existing_suffix, new_prefix, new_suffix
+        ):
+            return rule
+    return None
+
+
+def _extract_filter(rule: dict) -> tuple:
+    """Pull (prefix, suffix) out of an S3 NotificationConfiguration rule."""
+    filter_spec = rule.get("Filter") or {}
+    key_spec = filter_spec.get("Key") or {}
+    prefix_val = ""
+    suffix_val = ""
+    for fr in key_spec.get("FilterRules", []) or []:
+        name = (fr.get("Name") or "").lower()
+        if name == "prefix":
+            prefix_val = fr.get("Value") or ""
+        elif name == "suffix":
+            suffix_val = fr.get("Value") or ""
+    return prefix_val, suffix_val
+
+
+def _filters_overlap(
+    a_prefix: str, a_suffix: str, b_prefix: str, b_suffix: str
+) -> bool:
+    """Return True when two (prefix, suffix) filters could match the same key.
+
+    Conservative: any ambiguity returns True so we degrade gracefully
+    rather than let S3 reject the whole notification config.
+    """
+    # Prefix overlap: one is a string-prefix of the other, or either is empty.
+    prefix_overlap = (
+        not a_prefix
+        or not b_prefix
+        or a_prefix.startswith(b_prefix)
+        or b_prefix.startswith(a_prefix)
+    )
+    # Suffix overlap: analogous on the tail.
+    suffix_overlap = (
+        not a_suffix
+        or not b_suffix
+        or a_suffix.endswith(b_suffix)
+        or b_suffix.endswith(a_suffix)
+    )
+    return prefix_overlap and suffix_overlap
 
 
 def delete_s3_trigger(signal_id: str, bucket_name: Optional[str]) -> None:
     """Delete S3 bucket notification for a signal"""
     try:
+        # Defence-in-depth: signal rows written before the create/update
+        # strip-on-write logic may still carry trailing whitespace in
+        # the stored bucket name. Trim here so boto3's strict client
+        # side validation doesn't refuse the delete.
+        if isinstance(bucket_name, str):
+            bucket_name = bucket_name.strip()
+
         if not bucket_name:
             logger.warning("No bucket name provided", extra={"signal_id": signal_id})
             return

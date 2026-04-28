@@ -24,7 +24,16 @@ A production-ready platform for managing and orchestrating multiple Bedrock Agen
 - **Conversation Continuity**: Maintain conversation context across task executions
 - **Ambient Signals**: Trigger agents based on S3 events and other signals
 - **Task Scheduling**: Automated task execution with cron-like scheduling
+- **Standalone Chat**: Dedicated `/chat` page with a ChatGPT-style interface for
+  free-form conversations with any registered agent, independent of jobs.
+  Threads are listed in a sidebar, messages render as GitHub-flavoured
+  Markdown, and the composer supports Enter-to-send.
+- **Interactive Job Chat**: Every job's detail page now exposes the same
+  chat surface on its `Chat` tab. Sending a message from that tab resumes
+  the job (or answers an `awaiting_human` interrupt), with the human turn
+  persisted synchronously so the UI never flickers.
 - **Real-time Updates**: SSE support for live task status updates
+
 
 ### Technical Features
 
@@ -212,6 +221,21 @@ This will:
 
 ## Agent Development
 
+The reference agent is built on `langchain.agents.create_agent`
+(LangGraph). This is the supported replacement for the legacy
+`create_react_agent` + `AgentExecutor` pipeline, which LangChain has
+deprecated. Behaviour is otherwise unchanged for existing deployments:
+the agent still exposes the same entry point, the same tool factory,
+and the same `config.yaml` surface. Two things are worth knowing when
+writing or modifying tools:
+
+- The agent is a compiled LangGraph at construction time and stateless
+  across invocations; session state is tracked by the platform wrapper
+  in `core/agent_core.py` and injected as message history on each call.
+- Tool exceptions are caught by the graph rather than propagated to
+  the invoker. `tools/human_input.py` uses a sentinel return value
+  (not an exception) to signal that human input is required.
+
 ### Project Structure
 
 ```
@@ -223,7 +247,7 @@ agent/
 ├── .env.example             # Environment template
 │
 ├── core/                    # Platform integration (rarely modified)
-│   ├── agent_core.py       # Main agent implementation
+│   ├── agent_core.py       # create_agent wrapper + session state
 │   ├── tool_factory.py     # Tool factory
 │   └── execution_control.py # Execution control
 │
@@ -232,6 +256,7 @@ agent/
     ├── human_input.py       # Human-in-the-loop
     └── s3_reader.py         # S3 file reader
 ```
+
 
 ### Available Tools
 
@@ -394,7 +419,19 @@ prompts:
 5. Monitor status: idle → busy → completed
 6. View results and conversation history
 
-### Test 2: Create an S3 Signal
+### Test 2: Chat with an Agent
+
+1. Navigate to **Chat** in the left sidebar.
+2. Click **"New chat"**, pick your registered agent, and click **Start chat**.
+3. Type a message and press Enter. The reply renders as Markdown in a
+   left-aligned bubble; your message appears right-aligned.
+4. You can also open any job on the **Jobs** page and use the **Chat**
+   tab to continue that job's conversation. For jobs that are
+   `awaiting_human`, the message you send is forwarded as the human
+   response and the job resumes automatically.
+
+### Test 3: Create an S3 Signal
+
 
 #### Create S3 Bucket
 

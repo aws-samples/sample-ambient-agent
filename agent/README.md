@@ -15,6 +15,31 @@ This agent serves two main purposes:
 1. **Testing & Validation**: Deploy this agent to test the platform's features and ensure everything works correctly
 2. **Reference Implementation**: Use this as a template for building your own custom agents
 
+## 🔀 LangChain `create_agent` Migration
+
+The agent has migrated from the legacy `create_react_agent` +
+`AgentExecutor` pipeline to `langchain.agents.create_agent`
+(LangGraph-based). The legacy API is being deprecated upstream and the
+new one is the current, actively supported entry point.
+
+What this means in practice:
+
+- `core/agent_core.py` builds the agent once at module load with
+  `create_agent(model, tools, system_prompt)`; there is no separate
+  `AgentExecutor` wrapper anymore.
+- Conversation state is tracked by this wrapper per `session_id` and
+  replayed as `messages` on every invocation, since `create_agent` is
+  stateless across calls.
+- Tool error handling changed subtly: exceptions raised inside a tool
+  are captured by the graph rather than propagating up. For
+  interrupt-style flows (e.g. `tools/human_input.py`) we return a
+  sentinel value and the platform inspects the agent output to decide
+  whether human input is required.
+
+The `config.yaml` surface (agent settings, tool definitions, system
+prompt) is unchanged, so existing configurations continue to work.
+
+
 ## 📁 Project Structure
 
 ```

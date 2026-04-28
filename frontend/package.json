@@ -37,7 +37,7 @@
     "eslint": "^9.26.0",
     "eslint-plugin-react-hooks": "^5.1.0",
     "eslint-plugin-react-refresh": "^0.4.5",
-    "postcss": "^8.4.35",
+    "postcss": "^8.5.12",
     "sass": "^1.70.0",
     "typescript": "^5.2.2",
     "vite": "^7.3.1"

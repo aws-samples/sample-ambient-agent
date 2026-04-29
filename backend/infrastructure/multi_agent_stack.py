@@ -745,6 +745,13 @@ class MultiAgentStack(Stack):
         # (signalId, bucket, key, eventName, eTag).
         self.idempotency_table.grant_read_write_data(lambda_role)
 
+        # Allow the signal processor to enqueue work onto the job
+        # execution queue for signals configured with autoExecute=true.
+        # Signals that leave autoExecute at its default (False) never
+        # hit this path, so the grant is cheap insurance for the
+        # auto-execute feature.
+        self.job_execution_queue.grant_send_messages(lambda_role)
+
         # Grant S3 read permissions to access uploaded files if needed
         lambda_role.add_to_policy(
             iam.PolicyStatement(
@@ -772,6 +779,7 @@ class MultiAgentStack(Stack):
                 "AMBIENT_SIGNALS_TABLE": self.ambient_signals_table.table_name,
                 "TASK_REGISTRY_TABLE": self.task_registry_table.table_name,
                 "IDEMPOTENCY_TABLE": self.idempotency_table.table_name,
+                "JOB_EXECUTION_QUEUE_URL": self.job_execution_queue.queue_url,
                 "REGION": self.region,
             },
             dead_letter_queue_enabled=True,

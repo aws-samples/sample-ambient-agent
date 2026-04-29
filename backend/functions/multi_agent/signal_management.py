@@ -103,6 +103,13 @@ def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(_val, str):
                 configuration[_key] = _val.strip()
 
+        # autoExecute is optional and defaults to False so the review-
+        # first behaviour is preserved for signals created before this
+        # flag existed. When True the signal processor enqueues the job
+        # on the worker queue as soon as it persists the job record,
+        # and the agent runs without any user click.
+        auto_execute = bool(body.get("autoExecute", False))
+
         signal_item = {
             "signalId": signal_id,
             "userId": user_id,
@@ -112,6 +119,7 @@ def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
             "description": body.get("description", ""),
             "configuration": configuration,
             "enabled": body.get("enabled", True),
+            "autoExecute": auto_execute,
             "triggerCount": 0,
             "createdAt": now,
             "updatedAt": now,
@@ -353,6 +361,10 @@ def update_signal(event: Dict[str, Any]) -> Dict[str, Any]:
                     delete_s3_trigger(
                         signal_id, signal.get("configuration", {}).get("bucketName")
                     )
+
+        if "autoExecute" in body:
+            update_expression += ", autoExecute = :autoExecute"
+            expression_values[":autoExecute"] = bool(body["autoExecute"])
 
         # Update in DynamoDB
         response = signals_table.update_item(

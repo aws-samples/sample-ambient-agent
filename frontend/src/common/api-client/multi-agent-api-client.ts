@@ -381,6 +381,7 @@ export class MultiAgentApiClient {
           description: signalData.description,
           configuration: signalData.configuration,
           enabled: signalData.enabled,
+          autoExecute: signalData.autoExecute,
         },
       },
       "create signal",
@@ -391,16 +392,27 @@ export class MultiAgentApiClient {
     signalId: string,
     signalData: UpdateSignalRequest,
   ): Promise<Signal> {
+    // Only send fields the caller actually provided. `update_signal`
+    // on the backend checks `if "<field>" in body` to decide whether to
+    // write it, so sending `undefined` would still trip that check and
+    // overwrite real values with `null`. `autoExecute` specifically is
+    // a boolean: we cannot substitute `||` / default handling for it
+    // because `false` is a valid, deliberate value the user toggled.
+    const body: Record<string, unknown> = {};
+    if (signalData.signalName !== undefined)
+      body.signalName = signalData.signalName;
+    if (signalData.description !== undefined)
+      body.description = signalData.description;
+    if (signalData.configuration !== undefined)
+      body.configuration = signalData.configuration;
+    if (signalData.enabled !== undefined) body.enabled = signalData.enabled;
+    if (signalData.autoExecute !== undefined)
+      body.autoExecute = signalData.autoExecute;
     return apiFetch<Signal>(
       `/signals/${signalId}`,
       {
         method: "PUT",
-        body: {
-          signalName: signalData.signalName,
-          description: signalData.description,
-          configuration: signalData.configuration,
-          enabled: signalData.enabled,
-        },
+        body,
       },
       "update signal",
     );

@@ -32,6 +32,7 @@ import { apiClient } from "../common/api-client/api-clients";
 import {
   Signal,
   CreateSignalRequest,
+  UpdateSignalRequest,
   SignalFormData,
   Agent,
 } from "../types/multi-agent";
@@ -41,6 +42,10 @@ export default function SignalsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [selectedItems, setSelectedItems] = useState<Signal[]>([]);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  // When set, the modal opens in edit mode, prefilled from the signal
+  // currently being edited. Kept as a separate state from the create
+  // modal so the two flows can coexist without confusion.
+  const [editingSignalId, setEditingSignalId] = useState<string | null>(null);
   const [filteringText, setFilteringText] = useState("");
   const [currentPageIndex, setCurrentPageIndex] = useState(1);
   const [activeTabId, setActiveTabId] = useState("all");
@@ -61,6 +66,10 @@ export default function SignalsPage() {
       fileTypes: ["*"],
     },
     enabled: true,
+    // autoExecute defaults to false so the signal creates an inbox job
+    // that the user can review and run manually. Flip to true for
+    // fully-autonomous S3 -> agent flows.
+    autoExecute: false,
   });
 
   // Handle signal viewing
@@ -204,6 +213,25 @@ export default function SignalsPage() {
     },
   });
 
+  // Update signal mutation (edit modal)
+  const updateSignalMutation = useMutation({
+    mutationFn: ({
+      signalId,
+      updates,
+    }: {
+      signalId: string;
+      updates: UpdateSignalRequest;
+    }) => apiClient.multiAgentClient.updateSignal(signalId, updates),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["signals"] });
+      queryClient.invalidateQueries({ queryKey: ["all-signals-for-counts"] });
+      queryClient.invalidateQueries({ queryKey: ["signal"] });
+      setEditingSignalId(null);
+      setSelectedItems([]);
+      resetForm();
+    },
+  });
+
   const resetForm = () => {
     setFormData({
       signalName: "",
@@ -216,6 +244,7 @@ export default function SignalsPage() {
         fileTypes: ["*"],
       },
       enabled: true,
+      autoExecute: false,
     });
   };
 
@@ -227,12 +256,49 @@ export default function SignalsPage() {
       description: formData.description,
       configuration: formData.configuration,
       enabled: formData.enabled,
+      autoExecute: formData.autoExecute,
     });
   };
 
   const handleDeleteSelected = () => {
     selectedItems.forEach((signal) => {
       deleteSignalMutation.mutate(signal.signalId);
+    });
+  };
+
+  const handleEditSelected = () => {
+    if (selectedItems.length !== 1) return;
+    const signal = selectedItems[0];
+    setEditingSignalId(signal.signalId);
+    setFormData({
+      signalName: signal.signalName,
+      signalType: signal.signalType,
+      agentId: signal.agentId,
+      description: signal.description || "",
+      configuration: {
+        bucketName: signal.configuration?.bucketName || "",
+        prefix: signal.configuration?.prefix || "",
+        suffix: signal.configuration?.suffix || "",
+        fileTypes: signal.configuration?.fileTypes || ["*"],
+      },
+      enabled: signal.enabled,
+      autoExecute: Boolean(signal.autoExecute),
+    });
+  };
+
+  const handleUpdateSignal = () => {
+    if (!editingSignalId) return;
+    // Only send fields the backend's update_signal handler accepts:
+    // signalName, description, configuration, enabled, autoExecute.
+    updateSignalMutation.mutate({
+      signalId: editingSignalId,
+      updates: {
+        signalName: formData.signalName,
+        description: formData.description,
+        configuration: formData.configuration,
+        enabled: formData.enabled,
+        autoExecute: formData.autoExecute,
+      },
     });
   };
 
@@ -599,6 +665,12 @@ export default function SignalsPage() {
                   actions={
                     <SpaceBetween direction="horizontal" size="xs">
                       <Button
+                        disabled={selectedItems.length !== 1}
+                        onClick={handleEditSelected}
+                      >
+                        Edit Selected
+                      </Button>
+                      <Button
                         disabled={selectedItems.length === 0}
                         onClick={handleDeleteSelected}
                         loading={deleteSignalMutation.isPending}
@@ -623,10 +695,20 @@ export default function SignalsPage() {
             />
           </Container>
 
-          {/* Create Signal Modal */}
+          {/* Create / Edit Signal Modal. The same modal backs both flows
+              so the form and field validation stay in one place; the
+              submit button and header switch based on which state is
+              active. */}
           <Modal
-            onDismiss={() => setShowCreateModal(false)}
-            visible={showCreateModal}
+            onDismiss={() => {
+              if (editingSignalId) {
+                setEditingSignalId(null);
+                resetForm();
+              } else {
+                setShowCreateModal(false);
+              }
+            }}
+            visible={showCreateModal || editingSignalId !== null}
             closeAriaLabel="Close modal"
             size="large"
             footer={
@@ -634,29 +716,50 @@ export default function SignalsPage() {
                 <SpaceBetween direction="horizontal" size="xs">
                   <Button
                     variant="link"
-                    onClick={() => setShowCreateModal(false)}
+                    onClick={() => {
+                      if (editingSignalId) {
+                        setEditingSignalId(null);
+                        resetForm();
+                      } else {
+                        setShowCreateModal(false);
+                      }
+                    }}
                   >
                     Cancel
                   </Button>
                   <Button
                     variant="primary"
-                    onClick={handleCreateSignal}
-                    loading={createSignalMutation.isPending}
+                    onClick={
+                      editingSignalId ? handleUpdateSignal : handleCreateSignal
+                    }
+                    loading={
+                      editingSignalId
+                        ? updateSignalMutation.isPending
+                        : createSignalMutation.isPending
+                    }
                     disabled={!formData.signalName || !formData.agentId}
                   >
-                    Create Signal
+                    {editingSignalId ? "Save Changes" : "Create Signal"}
                   </Button>
                 </SpaceBetween>
               </Box>
             }
-            header="Create New Ambient Signal"
+            header={
+              editingSignalId ? "Edit Ambient Signal" : "Create New Ambient Signal"
+            }
           >
             <Form>
               <SpaceBetween direction="vertical" size="l">
-                {createSignalMutation.error && (
+                {createSignalMutation.error && !editingSignalId && (
                   <Alert type="error">
                     Failed to create signal:{" "}
                     {createSignalMutation.error.message}
+                  </Alert>
+                )}
+                {updateSignalMutation.error && editingSignalId && (
+                  <Alert type="error">
+                    Failed to update signal:{" "}
+                    {updateSignalMutation.error.message}
                   </Alert>
                 )}
 
@@ -682,7 +785,11 @@ export default function SignalsPage() {
 
                 <FormField
                   label="Agent"
-                  description="Select which agent will respond to this signal"
+                  description={
+                    editingSignalId
+                      ? "Agent assignment is fixed for a signal after creation; create a new signal to target a different agent."
+                      : "Select which agent will respond to this signal"
+                  }
                 >
                   <Select
                     selectedOption={
@@ -698,6 +805,7 @@ export default function SignalsPage() {
                     }
                     options={agentOptions}
                     placeholder="Choose an agent"
+                    disabled={Boolean(editingSignalId)}
                   />
                 </FormField>
 
@@ -787,6 +895,28 @@ export default function SignalsPage() {
                     }
                   >
                     Signal is {formData.enabled ? "enabled" : "disabled"}
+                  </Toggle>
+                </FormField>
+
+                <FormField
+                  label="Auto-execute when triggered"
+                  description={
+                    formData.autoExecute
+                      ? "The agent will run immediately after the signal fires - fully autonomous."
+                      : "The signal will create an inbox job that you review and run manually."
+                  }
+                >
+                  <Toggle
+                    checked={formData.autoExecute}
+                    onChange={({ detail }) =>
+                      setFormData({
+                        ...formData,
+                        autoExecute: detail.checked,
+                      })
+                    }
+                  >
+                    Auto-execute is{" "}
+                    {formData.autoExecute ? "enabled" : "disabled"}
                   </Toggle>
                 </FormField>
               </SpaceBetween>

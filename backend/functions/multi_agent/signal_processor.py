@@ -31,6 +31,7 @@ metrics = Metrics(namespace="AmbientAgents", service="signal-processor")
 # Initialize AWS clients
 dynamodb = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
+sqs_client = boto3.client("sqs")
 
 # Environment variables
 SIGNALS_TABLE = os.environ.get("AMBIENT_SIGNALS_TABLE")
@@ -38,6 +39,12 @@ TASK_REGISTRY_TABLE = os.environ.get("TASK_REGISTRY_TABLE")
 TASK_EXECUTION_FUNCTION = os.environ.get("TASK_EXECUTION_FUNCTION_NAME")
 REGION = os.environ.get("REGION", "us-east-1")
 IDEMPOTENCY_TABLE = os.environ.get("IDEMPOTENCY_TABLE", "")
+# When set, the signal processor can enqueue a job directly onto the
+# worker queue for signals configured with `autoExecute: true`. Without
+# this env var the auto-execute branch short-circuits and the job stays
+# in `idle` for a human to run manually, preserving the review-first
+# default behaviour.
+JOB_EXECUTION_QUEUE_URL = os.environ.get("JOB_EXECUTION_QUEUE_URL", "")
 
 
 # Powertools idempotency persistence layer. Keyed on
@@ -231,6 +238,14 @@ Please analyze this file upload event and provide a summary or take appropriate 
                 signal['signalName']
             }' was triggered with payload: {json.dumps(payload, indent=2)}"
 
+        # Honour the per-signal autoExecute flag. When True the signal
+        # processor will enqueue the job onto the worker queue right
+        # after persisting it, so the agent runs without any user
+        # action; when False (default) the job sits in `idle` and waits
+        # for the user to kick it off from the UI.
+        auto_execute = bool(signal.get("autoExecute", False))
+        initial_status = "busy" if auto_execute else "idle"
+
         # Create job record
         task_item = {
             "jobId": job_id,
@@ -238,7 +253,7 @@ Please analyze this file upload event and provide a summary or take appropriate 
             "agentId": signal["agentId"],
             "jobName": f"Signal: {signal['signalName']} - {payload.get('key', 'Event')}",
             "jobType": "signal_triggered",
-            "status": "idle",
+            "status": initial_status,
             "sessionId": session_id,
             "prompt": prompt,
             "requiresAction": False,
@@ -248,6 +263,7 @@ Please analyze this file upload event and provide a summary or take appropriate 
                 "signalId": signal["signalId"],
                 "signalType": signal["signalType"],
                 "triggerPayload": payload,
+                "autoExecute": auto_execute,
             },
         }
 
@@ -258,14 +274,76 @@ Please analyze this file upload event and provide a summary or take appropriate 
 
         logger.info(
             "Job created for signal",
-            extra={"signal_id": signal["signalId"], "job_id": job_id},
+            extra={
+                "signal_id": signal["signalId"],
+                "job_id": job_id,
+                "auto_execute": auto_execute,
+            },
         )
 
-        # Optionally auto-execute the job (for now, just create it)
-        # In a more advanced implementation, you might want to auto-execute
-        # based on signal configuration
+        # Auto-execute path: enqueue the job on the worker queue now so
+        # the agent fires without any user click. Any SQS failure is
+        # logged and the job is reset to `idle` so the user can still
+        # run it manually.
+        if auto_execute:
+            if not JOB_EXECUTION_QUEUE_URL:
+                logger.warning(
+                    "autoExecute=true but JOB_EXECUTION_QUEUE_URL is not "
+                    "configured; leaving job in idle so the user can run "
+                    "it manually",
+                    extra={"job_id": job_id},
+                )
+                task_table.update_item(
+                    Key={"jobId": job_id},
+                    UpdateExpression="SET #s = :s, updatedAt = :u",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":s": "idle",
+                        ":u": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            else:
+                try:
+                    sqs_client.send_message(
+                        QueueUrl=JOB_EXECUTION_QUEUE_URL,
+                        MessageBody=json.dumps(
+                            {
+                                "jobId": job_id,
+                                "signalTriggered": True,
+                                "signalId": signal["signalId"],
+                            }
+                        ),
+                    )
+                    metrics.add_metric(
+                        name="SignalAutoExecuted",
+                        unit=MetricUnit.Count,
+                        value=1,
+                    )
+                except Exception as enqueue_error:  # noqa: BLE001
+                    logger.error(
+                        "Auto-execute enqueue failed; resetting job to idle",
+                        extra={
+                            "job_id": job_id,
+                            "error": str(enqueue_error),
+                        },
+                        exc_info=True,
+                    )
+                    task_table.update_item(
+                        Key={"jobId": job_id},
+                        UpdateExpression="SET #s = :s, updatedAt = :u",
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={
+                            ":s": "idle",
+                            ":u": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
 
-        return {"signalId": signal["signalId"], "jobId": job_id, "status": "created"}
+        return {
+            "signalId": signal["signalId"],
+            "jobId": job_id,
+            "status": "created",
+            "autoExecute": auto_execute,
+        }
 
     except Exception as e:
         logger.error(

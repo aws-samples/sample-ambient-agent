@@ -198,6 +198,11 @@ export interface Signal {
   description: string;
   configuration: SignalConfiguration;
   enabled: boolean;
+  // When true, the signal processor enqueues the created job onto the
+  // worker queue immediately, so the agent fires without any user click.
+  // When false (default), the job lands in "idle" and the user runs it
+  // from the Jobs page - useful for review-first workflows.
+  autoExecute?: boolean;
   triggerCount?: number;
   lastTriggered?: string;
   createdAt: string;
@@ -229,6 +234,7 @@ export interface CreateSignalRequest {
   description?: string;
   configuration: SignalConfiguration;
   enabled?: boolean;
+  autoExecute?: boolean;
 }
 
 export interface UpdateSignalRequest {
@@ -236,6 +242,7 @@ export interface UpdateSignalRequest {
   description?: string;
   configuration?: SignalConfiguration;
   enabled?: boolean;
+  autoExecute?: boolean;
 }
 
 export interface ListSignalsResponse {
@@ -260,6 +267,7 @@ export interface SignalFormData {
   description: string;
   configuration: SignalConfiguration;
   enabled: boolean;
+  autoExecute: boolean;
 }
 
 // -----------------------------------------------------------------------

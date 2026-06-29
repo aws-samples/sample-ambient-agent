@@ -48,7 +48,7 @@
     },
     "@remix-run/router": "^1.23.2",
     "fast-xml-parser": "^5.5.6",
-    "js-yaml": "^4.1.1",
+    "js-yaml": "^4.3.0",
     "lodash": "^4.17.23",
     "mdast-util-to-hast": "^13.2.1",
     "react-router": "^6.30.2",

@@ -23,12 +23,13 @@ import {
   Toggle,
   Link,
 } from "@cloudscape-design/components";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams, useNavigate } from "react-router-dom";
 import BaseAppLayout from "../components/base-app-layout";
 import ConversationHistory from "../components/conversation-history";
 import { apiClient } from "../common/api-client/api-clients";
+import { fetchSignalUploadsBucket } from "../common/helpers/platform-config";
 import {
   Signal,
   CreateSignalRequest,
@@ -116,6 +117,26 @@ export default function SignalsPage() {
     queryKey: ["agents-for-signals"],
     queryFn: () => apiClient.multiAgentClient.listAgents({ pageSize: 100 }),
   });
+
+  // The single S3 bucket ambient signals are allowed to watch. The
+  // backend rejects any other bucket name, so the form field below is
+  // prefilled and read-only rather than free text.
+  const { data: signalUploadsBucket } = useQuery({
+    queryKey: ["signal-uploads-bucket"],
+    queryFn: fetchSignalUploadsBucket,
+    staleTime: Infinity,
+  });
+
+  // Prefill the bucket name once it's known, for the "create" flow
+  // (the field is read-only so this is the only way it gets set).
+  useEffect(() => {
+    if (signalUploadsBucket && !formData.configuration.bucketName) {
+      setFormData((prev) => ({
+        ...prev,
+        configuration: { ...prev.configuration, bucketName: signalUploadsBucket },
+      }));
+    }
+  }, [signalUploadsBucket]);
 
   // Fetch specific signal if signalId in URL
   const { data: specificSignal } = useQuery({
@@ -239,7 +260,7 @@ export default function SignalsPage() {
       agentId: "",
       description: "",
       configuration: {
-        bucketName: "",
+        bucketName: signalUploadsBucket || "",
         prefix: "",
         fileTypes: ["*"],
       },
@@ -827,10 +848,16 @@ export default function SignalsPage() {
                   <SpaceBetween direction="vertical" size="s">
                     <FormField
                       label="S3 Bucket Name"
-                      description="The S3 bucket to monitor for file uploads"
+                      description="Signals may only watch the platform-managed uploads bucket. Upload sample files here to trigger this signal."
                     >
                       <Input
-                        value={formData.configuration.bucketName || ""}
+                        value={
+                          formData.configuration.bucketName ||
+                          signalUploadsBucket ||
+                          ""
+                        }
+                        disabled
+                        readOnly
                         onChange={({ detail }) =>
                           setFormData({
                             ...formData,

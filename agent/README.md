@@ -46,8 +46,11 @@ prompt) is unchanged, so existing configurations continue to work.
 agent/
 ├── agent.py                 # Entry point (imports from core)
 ├── config.example.yaml      # Configuration template
-├── requirements.txt         # Python dependencies
-├── deploy_agent.sh          # Deployment script
+├── requirements.txt         # Python dependencies (pip/local dev)
+├── pyproject.toml           # Python dependencies (required by the AgentCore
+│                             # CLI's CodeZip build; keep in sync with requirements.txt)
+├── deploy_agent.sh          # Deployment script (wraps `agentcore deploy`)
+├── attach_agent_policies.sh # Attaches policies/*.json to the execution role
 ├── .env.example             # Environment variables example
 ├── README.md                # This file
 │
@@ -63,6 +66,13 @@ agent/
     ├── human_input.py       # Platform: Human-in-the-loop tool
     └── s3_reader.py         # Platform: S3 file reader tool
 ```
+
+The `../AmbientAgent` project (a sibling of this `agent/` directory) holds
+the AgentCore CLI's own deployment metadata (`agentcore.json`, its CDK app)
+and is created automatically on first run of `deploy_agent.sh` (via
+`agentcore create` + `agentcore add agent`). It
+never contains a copy of this code — its `agentcore.json` points at this
+directory via `codeLocation`.
 
 ## 🔧 Core Components
 
@@ -138,9 +148,22 @@ cp .env.example .env
 ### 4. Deploy the Agent
 
 ```bash
-# Deploy to AWS Lambda
 ./deploy_agent.sh
 ```
+
+On first run, this creates the sibling AgentCore CLI project at
+`../AmbientAgent` (as a `byo` runtime pointed at this directory), creates
+an IAM execution role scoped only to what's in `policies/*.json`, and pins
+that role into the new project's `agentcore.json` — no manual
+`agentcore create`/`agentcore add agent` steps or hand-pasted role ARN
+required. Subsequent runs reuse both.
+
+Override the project location with `AGENTCORE_PROJECT_DIR` (env var) or
+`--project-dir`, or pass `--role-arn <arn>` to use an existing role instead
+of creating one. After editing a file under `policies/*.json` when the
+runtime itself doesn't need re-provisioning, run
+`./deploy_agent.sh --policies-only` to re-sync just the IAM policy without
+a full redeploy — see `./deploy_agent.sh --help`.
 
 ### 5. Register with Platform
 
@@ -350,9 +373,19 @@ print(result)
 
 ### Agent Not Responding
 
-- Check CloudWatch logs for errors
+- Check CloudWatch logs for errors (`agentcore logs --runtime ambient` from `../AmbientAgent`)
 - Verify AWS credentials
 - Ensure Bedrock model access
+- `ValidationException: The guardrail identifier or version provided in the
+  request does not exist` — `aws.bedrock.region_name` in `config.yaml`
+  doesn't match the region the guardrail was created in (the backend
+  stack's region). Fix and redeploy with `./deploy_agent.sh`.
+
+### Agent Deployment Fails with "OpenTelemetry instrumentation executable not found"
+
+- `agent/pyproject.toml` is missing `aws-opentelemetry-distro` — required
+  for the AgentCore Runtime to run `opentelemetry-instrument` at startup.
+  Add it to `[project].dependencies` and redeploy.
 
 ### Tools Not Working
 

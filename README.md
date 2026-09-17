@@ -49,10 +49,15 @@ Before starting, ensure you have:
 
 - AWS CLI configured with appropriate credentials
 - AWS Account ID and default region noted
-- Node.js 18+ and npm installed
+- Node.js 20+ and npm installed
 - Python 3.11+ installed
 - AWS CDK CLI installed (`npm install -g aws-cdk`)
-- Docker installed and running (required for agent deployment)
+- AgentCore CLI installed (`npm install -g @aws/agentcore@latest`) — this
+  replaces the older Python `bedrock-agentcore-starter-toolkit`
+  (`agentcore configure`/`agentcore launch`), which AWS has superseded.
+  If a plain `agentcore --version` errors instead of printing a version,
+  an old Python `agentcore` is shadowing the npm one on your PATH; run
+  `pip uninstall bedrock-agentcore-starter-toolkit` and open a new shell.
 - Git Bash or similar Unix-like shell (for Windows users)
 
 ## Quick Start
@@ -88,10 +93,34 @@ cdk deploy --all
 cd ../agent
 cp .env.example .env
 cp config.example.yaml config.yaml
-# Edit both files with your AWS configuration
+```
 
+Edit `.env`:
+
+- `AWS_ACCOUNT_ID` / `AWS_DEFAULT_REGION` — your account and region.
+- `AGENT_S3_BUCKET_NAME` — copy from the backend stack's `SignalUploadsBucketName`
+  output (step 3). Scopes the agent's S3 read tool and IAM role to this single
+  bucket instead of the whole account.
+
+Edit `config.yaml`:
+
+- `aws.bedrock.region_name` — set to the same region you deployed the backend
+  stack to. Bedrock Guardrails are region-scoped, so a mismatch here causes
+  `ValidationException: The guardrail identifier or version provided in the
+  request does not exist` at invoke time.
+- `aws.bedrock.guardrail_id` / `aws.bedrock.guardrail_version` — copy from the
+  backend stack's `AgentGuardrailId` / `AgentGuardrailVersion` outputs (step 3),
+  so the agent's model calls are protected by a prompt-attack filter.
+- Customize model, tools, and prompts as needed.
+
+```bash
 ./deploy_agent.sh
 ```
+
+On first run this bootstraps the sibling AgentCore CLI project at
+`../AmbientAgent` and creates a scoped IAM execution role automatically —
+see `agent/README.md` for details. No manual `agentcore create` step or
+IAM role needed beforehand.
 
 ### 5. Access Application
 
@@ -154,6 +183,8 @@ cdk deploy --all
 - `UserInterfaceDomainName`: Your CloudFront URL
 - `MultiAgentApiEndpoint`: Your API Gateway URL
 - `CognitoUsers`: List of created users
+- `SignalUploadsBucketName`: The only S3 bucket ambient signals may watch — you'll need this in Step 4
+- `AgentGuardrailId` / `AgentGuardrailVersion`: The Bedrock Guardrail applied to agent model calls — you'll need these in Step 4
 
 ### Part 2: Agent Deployment
 
@@ -169,26 +200,56 @@ cp config.example.yaml config.yaml
 
 Edit `.env`:
 
+- `AWS_ACCOUNT_ID` / `AWS_DEFAULT_REGION` — your account and region.
+- `AGENT_S3_BUCKET_NAME` — copy from the backend stack's `SignalUploadsBucketName`
+  output (Part 1, Step 3). Scopes the agent's S3 read tool and IAM role to this
+  single bucket instead of the whole account.
+
 ```bash
 AWS_ACCOUNT_ID=123456789012
 AWS_DEFAULT_REGION=us-east-1
-INVOKE_AGENT_ARN=  # Leave blank
+AGENT_S3_BUCKET_NAME=react-starter-multiagent-signaluploadsbucket-xxxxxxxx
 ```
 
-Edit `config.yaml` to customize your agent settings (model, tools, prompts, etc.)
+Edit `config.yaml`:
+
+- `aws.bedrock.region_name` — must match the region the backend stack was
+  deployed to (Part 1, Step 3). Bedrock Guardrails are region-scoped; a
+  mismatch produces `ValidationException: The guardrail identifier or
+  version provided in the request does not exist` at invoke time.
+- `aws.bedrock.guardrail_id` / `aws.bedrock.guardrail_version` — copy from the
+  backend stack's `AgentGuardrailId` / `AgentGuardrailVersion` outputs
+  (Part 1, Step 3), so the agent's model calls are protected by a
+  prompt-attack filter.
+- Customize model, tools, and prompts as needed.
 
 #### Step 5: Deploy Agent
 
 ```bash
+cd ../agent
 ./deploy_agent.sh
 ```
 
-This will:
+On first run, this script:
 
-- Build the agent Docker container
-- Push to Amazon ECR
-- Deploy using Bedrock Agent Core SDK
-- Create necessary IAM roles
+1. Creates the sibling AgentCore CLI project at `../AmbientAgent` (a `byo`
+   runtime pointed at this `agent/` directory) — equivalent to running
+   `agentcore create` + `agentcore add agent` yourself, but automated.
+2. Creates an IAM execution role trusted only by
+   `bedrock-agentcore.amazonaws.com` for this account/region, with no
+   permissions of its own, and pins it into the new project's
+   `agentcore.json`.
+3. Attaches the permissions from `agent/policies/*.json` (Bedrock invoke +
+   guardrail, S3 read scoped to `AGENT_S3_BUCKET_NAME`, CloudWatch logs,
+   plus the baseline every AgentCore runtime needs to boot — ECR image
+   pull, workload identity token, X-Ray/CloudWatch metrics) to that role.
+4. Runs `agentcore deploy`, packaging `agent/` as a CodeZip artifact and
+   provisioning the AgentCore Runtime via CloudFormation.
+
+Subsequent runs reuse the same project and role, re-attaching the policy in
+case `agent/policies/*.json` changed. Pass `--role-arn <arn>` to use an
+existing role instead, or `--project-dir <path>` if you've placed the
+AgentCore project somewhere other than `../AmbientAgent`.
 
 **Copy the Agent Runtime ARN from the output!**
 
@@ -200,7 +261,7 @@ This will:
 4. Click **"Register New Agent"**
 5. Fill in:
    - Agent Name: "My Agent"
-   - Agent Runtime ARN: (from step 6)
+   - Agent Runtime ARN: (from step 5)
    - Description: What your agent does
 6. Click **"Register Agent"**
 
@@ -216,8 +277,12 @@ This will:
 
 ### Auto-Generated Files (Don't Create Manually)
 
-- `agent/.bedrock_agentcore.yaml` - Created by agent deployment
-- `agent/.bedrock_agentcore/` - Agent deployment artifacts
+- `AmbientAgent/` - The AgentCore CLI project (sibling of `agent/`); created
+  automatically on first run of `deploy_agent.sh` (see Step 5 above).
+  Contains only deployment tooling (`agentcore.json`, the CDK app that
+  provisions the runtime, `.cli/` state) — never your agent's source code,
+  which stays in `agent/` and is referenced via `codeLocation`.
+- `agent/.venv/` - Local virtual environment, if you created one
 
 ## Agent Development
 
@@ -242,8 +307,11 @@ writing or modifying tools:
 agent/
 ├── agent.py                 # Entry point
 ├── config.example.yaml      # Configuration template
-├── requirements.txt         # Dependencies
-├── deploy_agent.sh          # Deployment script
+├── requirements.txt         # Dependencies (pip/local dev)
+├── pyproject.toml           # Dependencies (required by the AgentCore CLI's
+│                             # CodeZip build - kept in sync with requirements.txt)
+├── deploy_agent.sh          # Deployment script (wraps `agentcore deploy`)
+├── attach_agent_policies.sh # Attaches agent/policies/*.json to the execution role
 ├── .env.example             # Environment template
 │
 ├── core/                    # Platform integration (rarely modified)
@@ -255,6 +323,12 @@ agent/
     ├── calculator.py        # Example tool
     ├── human_input.py       # Human-in-the-loop
     └── s3_reader.py         # S3 file reader
+
+AmbientAgent/                # Sibling of agent/ - AgentCore CLI project only.
+└── agentcore/
+    ├── agentcore.json       # Runtime spec; codeLocation points at ../agent/
+    ├── aws-targets.json     # Deployment target (account/region)
+    └── cdk/                 # CDK app the CLI uses to provision the runtime
 ```
 
 
@@ -432,12 +506,10 @@ prompts:
 
 ### Test 3: Create an S3 Signal
 
-
-#### Create S3 Bucket
-
-```bash
-aws s3 mb s3://my-agent-test-bucket-$(date +%s)
-```
+Ambient signals can only watch the single, stack-owned signal-uploads
+bucket — the `SignalUploadsBucketName` output from Part 1, Step 3 — not an
+arbitrary bucket of your choosing. The Signals page's bucket field is
+pre-filled and read-only for this reason (see `THREAT_MODEL.md`).
 
 #### Configure Signal
 
@@ -446,7 +518,7 @@ aws s3 mb s3://my-agent-test-bucket-$(date +%s)
 3. Fill in:
    - Signal Name: "Document Processor"
    - Agent: Select your agent
-   - S3 Bucket: Your bucket name
+   - S3 Bucket: pre-filled with the platform's signal-uploads bucket
    - Prefix: `documents/` (optional)
    - Suffix: `.txt` (optional)
 4. Enable signal
@@ -457,8 +529,9 @@ aws s3 mb s3://my-agent-test-bucket-$(date +%s)
 # Create test document
 echo "AWS Lambda is a serverless compute service..." > test.txt
 
-# Upload to S3
-aws s3 cp test.txt s3://your-bucket-name/documents/test.txt
+# Upload to the SAME bucket shown in the Signals page (get the exact name
+# from the SignalUploadsBucketName stack output if unsure)
+aws s3 cp test.txt s3://<signal-uploads-bucket-name>/documents/test.txt
 ```
 
 Check the **Jobs** page - a new job should be automatically created!
@@ -469,10 +542,20 @@ Check the **Jobs** page - a new job should be automatically created!
 
 **Solution**:
 
-1. Ensure Docker is running: `docker ps`
-2. Check AWS credentials: `aws sts get-caller-identity`
-3. Verify ECR and IAM permissions
-4. Check deployment logs
+1. Check AWS credentials: `aws sts get-caller-identity`
+2. Confirm the AgentCore CLI is on PATH and not shadowed by the old Python
+   toolkit: `agentcore --version` should print a version, not an error. If
+   it errors, `pip uninstall bedrock-agentcore-starter-toolkit` and open a
+   new shell.
+3. Run `agentcore validate` from `AmbientAgent/` to catch config errors
+   before deploying.
+4. `CREATE_FAILED ... OpenTelemetry instrumentation executable not found`
+   means `agent/pyproject.toml` is missing `aws-opentelemetry-distro` —
+   the AgentCore Runtime needs it to run `opentelemetry-instrument`.
+5. Verify IAM permissions on the pinned `executionRoleArn` and on your own
+   credentials (CDK bootstrap role assumption) — see
+   `AmbientAgent/agentcore/.cli/logs/import/` or `deploy/` for detailed logs.
+6. Check deployment logs via `agentcore logs --runtime ambient`.
 
 ### Jobs Stay in "Busy" Status
 
@@ -487,10 +570,17 @@ Check the **Jobs** page - a new job should be automatically created!
 
 **Solution**:
 
-1. Verify S3 bucket name is correct
+1. Confirm you uploaded to the exact `SignalUploadsBucketName` bucket, not a
+   different bucket with a similar name — the stack also creates an
+   access-logs bucket for it whose name looks similar at a glance; only
+   the one shown in the Signals page / stack output actually has the
+   notification wired to the signal processor.
 2. Check signal is enabled (Status: Active)
 3. Ensure file matches prefix/suffix filters
 4. Check CloudWatch logs for signal processor
+5. Verify the notification is actually installed: `aws s3api
+   get-bucket-notification-configuration --bucket <bucket-name>` should
+   list a `LambdaFunctionConfigurations` entry for your signal.
 
 ### CORS Errors in Browser
 
@@ -528,10 +618,10 @@ cd agent
 ### View Logs
 
 ```bash
-# Agent logs
-aws logs tail /aws/lambda/bedrock-agentcore-agent --follow
+# Agent runtime logs (via the AgentCore CLI, from AmbientAgent/)
+(cd AmbientAgent && agentcore logs --runtime ambient --follow)
 
-# Platform logs
+# Platform API access logs
 aws logs tail /aws/apigateway/bedrock-agent-core-agents-MultiAgent --follow
 
 # Lambda function logs

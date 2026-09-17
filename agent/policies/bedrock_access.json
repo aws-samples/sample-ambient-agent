@@ -12,6 +12,27 @@
         "arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
         "arn:aws:bedrock:*::foundation-model/us.anthropic.claude-*"
       ]
+    },
+    {
+      "Sid": "BedrockInvokeInferenceProfile",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*:${AWS_ACCOUNT_ID}:inference-profile/us.anthropic.claude-*"
+      ]
+    },
+    {
+      "Sid": "BedrockApplyGuardrail",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:ApplyGuardrail"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*:${AWS_ACCOUNT_ID}:guardrail/*"
+      ]
     }
   ]
 }

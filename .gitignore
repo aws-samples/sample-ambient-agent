@@ -8,6 +8,7 @@ cdk.out
 
 # Python
 .venv
+.venv*
 *__pycache__*
 
 # MISC
@@ -35,6 +36,11 @@ config.yml
 # Agent Config
 
 agent/config.yaml
+
+# AgentCore CLI project (generated locally via `agentcore create` /
+# `agentcore add agent`; contains the deployer's own account id, IAM
+# role ARN, and bucket name — see agent/README.md for how to regenerate it)
+/AmbientAgent
 
 # DevSecOps - Generated files (safe to ignore)
 ferret-sast-report.json

@@ -163,7 +163,7 @@ jobs:
       - name: Run License Compliance Check
         run: |
           echo "Checking license compliance..."
-          licensecheck --format=ansi --zero
+          licensecheck --format=ansi --zero -r backend/requirements.txt agent/requirements.txt
           echo "✓ All licenses are compliant"
 
       - name: Upload License Report

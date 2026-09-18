@@ -101,4 +101,4 @@ ignore_licenses = [
 
 # Packages to ignore (e.g., internal tools, dev-only dependencies)
 # Use this sparingly and document why each package is ignored
-ignore_packages = []
+ignore_packages = ["pylint", "astroid"]

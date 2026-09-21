@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ambient"
+version = "0.1.0"
+description = "Ambient agent for the Multi-Agent Platform (LangChain/LangGraph on Bedrock AgentCore)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "autopep8>=2.0.0,<3.0.0",
+    # Required for the AgentCore Runtime's OTEL auto-instrumentation
+    # (`opentelemetry-instrument`, see Dockerfile's CMD from the old
+    # container-based deploy). Without it CodeZip deploys fail at
+    # runtime creation with "OpenTelemetry instrumentation executable
+    # not found" - this package ships the `opentelemetry-instrument`
+    # entry point the AgentCore Runtime invokes to wrap the process.
+    "aws-opentelemetry-distro>=0.10.1",
+    "bedrock-agentcore>=1.0.0,<2.0.0",
+    "boto3>=1.37.0,<2.0.0",
+    "cachetools>=5.3.0,<6.0.0",
+    "deepagents==0.3.9",
+    "langchain>=1.0.0,<2.0.0",
+    "langchain-core>=1.0.0,<2.0.0",
+    "langchain_aws==1.2.1",
+    "langgraph>=1.0.0,<2.0.0",
+    "pyasn1>=0.6.3,<1.0.0",
+    "requests>=2.33.0,<3.0.0",
+    "simpleeval>=1.0.0,<2.0.0",
+    "tavily-python>=0.5.0,<1.0.0",
+]
+
+# pylint and autopep8 are dev-only tooling in the original
+# requirements.txt; kept out of the runtime dependency set the
+# AgentCore CDK build packages into the deployed image, but still
+# installable locally via `pip install -e .[dev]`.
+[project.optional-dependencies]
+dev = [
+    "pylint>=3.0.0,<4.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

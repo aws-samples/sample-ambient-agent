@@ -16,6 +16,8 @@ from aws_lambda_powertools import Logger
 from botocore.exceptions import ClientError
 from decimal import Decimal
 
+from authz import is_owner
+
 # Configure logging
 logger = Logger(service="signal-management", level="INFO")
 
@@ -31,6 +33,12 @@ SIGNAL_PROCESSOR_FUNCTION_NAME = os.environ.get("SIGNAL_PROCESSOR_FUNCTION_NAME"
 REGION = os.environ.get("REGION", "us-east-1")
 ACCOUNT_ID = boto3.client("sts").get_caller_identity()["Account"]
 
+# The only S3 bucket that s3_file_upload signals are allowed to watch.
+# Enforced so attaching a signal (and the invoke permission +
+# notification config that comes with it) can never target a bucket
+# outside the platform's own signal-uploads bucket.
+ALLOWED_SIGNAL_BUCKET = os.environ.get("ALLOWED_SIGNAL_BUCKET")
+
 
 def decimal_default(obj):
     """JSON serializer for objects not serializable by default json code"""
@@ -39,15 +47,57 @@ def decimal_default(obj):
     raise TypeError
 
 
+def _validate_signal_bucket(configuration: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Reject any configured bucketName that isn't the platform's own bucket.
+
+    Returns an error response dict if the configured bucket is not
+    allowed, or None if the configuration is acceptable (including the
+    case where no bucketName is set - other signal types don't need one).
+    """
+    bucket_name = configuration.get("bucketName")
+    if not bucket_name:
+        return None
+
+    if not ALLOWED_SIGNAL_BUCKET:
+        logger.error("ALLOWED_SIGNAL_BUCKET is not configured")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Signal bucket is not configured"}),
+        }
+
+    if bucket_name.strip() != ALLOWED_SIGNAL_BUCKET:
+        return {
+            "statusCode": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(
+                {
+                    "error": (
+                        "bucketName must be the platform-managed signal "
+                        f"uploads bucket: {ALLOWED_SIGNAL_BUCKET}"
+                    )
+                }
+            ),
+        }
+    return None
+
+
 def get_user_id_from_event(event: Dict[str, Any]) -> str:
-    """Extract user ID from the event context"""
-    try:
-        # Extract from Cognito JWT token
-        claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
-        return claims.get("sub") or claims.get("cognito:username", "unknown")
-    except Exception as e:
-        logger.warning("User ID extraction failed", extra={"error": str(e)})
-        return "unknown"
+    """Extract user ID from the event context.
+
+    Raises instead of returning a shared "unknown" sentinel on failure.
+    The old fallback failed open: every caller whose identity couldn't
+    be extracted collapsed onto the same fake userId, which meant they
+    all passed each other's ownership checks (including for
+    autoExecute signals). Every other handler in this platform
+    (job_management, chat_management, conversation_management) fails
+    closed on missing identity; this matches that behavior.
+    """
+    claims = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
+    user_id = claims.get("sub") or claims.get("cognito:username")
+    if not user_id:
+        raise PermissionError("Unable to determine user identity from request")
+    return user_id
 
 
 def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -66,7 +116,10 @@ def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
                     "body": json.dumps({"error": f"Missing required field: {field}"}),
                 }
 
-        # Verify agent exists
+        # Verify agent exists and is owned by the caller. Existence alone
+        # isn't enough - without the ownership check, any authenticated
+        # user could attach a signal (and the invoke permission that
+        # comes with it) to another user's registered agent.
         agent_table = dynamodb.Table(AGENT_REGISTRY_TABLE)
         try:
             agent_response = agent_table.get_item(Key={"agentId": body["agentId"]})
@@ -75,6 +128,12 @@ def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
                     "statusCode": 404,
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"error": "Agent not found"}),
+                }
+            if not is_owner(agent_response["Item"], user_id):
+                return {
+                    "statusCode": 403,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"error": "Access denied to agent"}),
                 }
         except ClientError as e:
             logger.error(
@@ -103,11 +162,20 @@ def create_signal(event: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(_val, str):
                 configuration[_key] = _val.strip()
 
+        # Reject any bucket that isn't the platform-managed signal
+        # uploads bucket.
+        bucket_error = _validate_signal_bucket(configuration)
+        if bucket_error:
+            return bucket_error
+
         # autoExecute is optional and defaults to False so the review-
-        # first behaviour is preserved for signals created before this
-        # flag existed. When True the signal processor enqueues the job
-        # on the worker queue as soon as it persists the job record,
-        # and the agent runs without any user click.
+        # first behaviour is the default. When True the signal processor
+        # enqueues the job on the worker queue as soon as it persists
+        # the job record, and the agent runs without any user click.
+        # Because _validate_signal_bucket (above) already restricts
+        # bucketName to the platform-managed uploads bucket, autoExecute
+        # can never grant unreviewed execution against an arbitrary
+        # caller-chosen bucket - only the platform's own bucket.
         auto_execute = bool(body.get("autoExecute", False))
 
         signal_item = {
@@ -337,6 +405,13 @@ def update_signal(event: Dict[str, Any]) -> Dict[str, Any]:
                 _val = new_configuration.get(_key)
                 if isinstance(_val, str):
                     new_configuration[_key] = _val.strip()
+
+            # Reject any bucket that isn't the platform-managed signal
+            # uploads bucket.
+            bucket_error = _validate_signal_bucket(new_configuration)
+            if bucket_error:
+                return bucket_error
+
             update_expression += ", configuration = :configuration"
             expression_values[":configuration"] = new_configuration
             # Keep the top-level bucketName GSI key in sync with the

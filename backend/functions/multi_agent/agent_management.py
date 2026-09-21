@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 import json
+import re
 import boto3
 import uuid
 import os
@@ -163,9 +164,23 @@ def register_agent(user_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
                 400, {"error": f"Invalid agent type. Must be one of: {valid_types}"}
             )
 
-        # Validate ARN format (basic validation)
+        # Validate ARN format. The previous check only tested a
+        # `startswith("arn:aws:bedrock-agent")` prefix, which a crafted
+        # string like "arn:aws:bedrock-agentcore-evil:us-east-1:..." (or
+        # any other service name sharing that prefix) would pass, and
+        # which also let an arbitrary region field flow straight into
+        # `agentcore_client_for_arn`'s boto3 client construction. This
+        # anchors the whole string to the actual AgentCore runtime ARN
+        # shape: partition, a literal `bedrock-agentcore` service, a
+        # region, a 12-digit account id, and a `runtime/<name>` resource.
         agent_arn = body["agentArn"]
-        if not agent_arn.startswith("arn:aws:bedrock-agent"):
+        arn_pattern = re.compile(
+            r"^arn:aws[a-zA-Z-]*:bedrock-agentcore:"
+            r"[a-z0-9-]+:"
+            r"\d{12}:"
+            r"runtime/[A-Za-z0-9_-]+$"
+        )
+        if not arn_pattern.match(agent_arn):
             return create_response(400, {"error": "Invalid agent ARN format"})
 
         # Create agent record

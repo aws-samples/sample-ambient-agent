@@ -79,10 +79,13 @@ def get_conversation_history(
 
         conversation = response["Item"]
 
-        # Verify user has access to this conversation
-        # We'll check if the user owns any jobs with this session ID
+        # Verify user has access to this conversation. Returning 404
+        # (not 403) for "exists but not yours" as well as "doesn't
+        # exist" avoids turning this endpoint into a session-id
+        # existence oracle - a caller iterating session ids couldn't
+        # otherwise distinguish "wrong owner" from "no such session".
         if not verify_user_access_to_session(user_id, session_id):
-            return create_response(403, {"error": "Access denied"})
+            return create_response(404, {"error": "Conversation not found"})
 
         # Get agent information
         agent_id = conversation.get("agentId")
@@ -227,16 +230,34 @@ def add_conversation_message(
 ) -> Dict[str, Any]:
     """Append a message to the conversation using atomic list_append."""
     try:
-        message_type = body.get("type")  # 'human' or 'ai'
+        message_type = body.get("type")
         content = body.get("content")
         agent_id = body.get("agentId")
 
         if not message_type or not content:
             return create_response(400, {"error": "Message type and content required"})
 
-        if message_type not in ["human", "ai"]:
-            return create_response(400, {"error": "Message type must be human or ai"})
+        # Only the human side of a turn can be written by an API
+        # caller. "ai" turns are meant to come from the agent-execution
+        # path (job_execution/chat_execution), not directly from a
+        # client - a client that could write "ai" turns could forge
+        # assistant responses into its own conversation history (or
+        # inject fabricated "prior agent statements" ahead of a later
+        # prompt-continuation read).
+        if message_type != "human":
+            return create_response(
+                400, {"error": "Only 'human' messages can be added via this API"}
+            )
 
+        # Note: unlike the GET handlers, POST legitimately creates a
+        # conversation on first use (_ensure_conversation_exists below),
+        # so a "not found" response here would be misleading - this
+        # verifies ownership of any EXISTING record before appending,
+        # and _ensure_conversation_exists's conditional put means a
+        # session id that doesn't exist yet is simply claimed by the
+        # first caller. A 403 here doesn't leak existence in the same
+        # way the GET oracle did, since the caller already knows the
+        # session id they're posting to.
         if not verify_user_access_to_session(user_id, session_id):
             return create_response(403, {"error": "Access denied"})
 

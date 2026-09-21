@@ -46,6 +46,9 @@ config = AppConfig(
     account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
     monitoring=monitoring_config,
     cognito=cognito_config,
+    enable_waf=config_data.get("enable_waf", False),
+    ip_allow_list=config_data.get("ip_allow_list"),
+    cloudfront_cache_disable=config_data.get("cloudfront_cache_disable", False),
 )
 
 # Deploy base infrastructure stack

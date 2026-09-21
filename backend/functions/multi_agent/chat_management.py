@@ -34,6 +34,8 @@ from aws_lambda_powertools import Logger
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
+from authz import is_owner
+
 
 logger = Logger(service="chat-management", level="INFO")
 
@@ -110,6 +112,15 @@ def _create_thread(user_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         return _response(404, {"error": "Agent not found"})
 
     agent = agent_resp["Item"]
+
+    # Ownership check: existence alone isn't enough - the caller must
+    # also own the agent, otherwise any authenticated user could open a
+    # chat thread against another user's registered agent (which may
+    # carry different tool grants / a different execution role).
+    # job_management.py's create_job does this same check.
+    if not is_owner(agent, user_id):
+        return _response(403, {"error": "Access denied to agent"})
+
     now = datetime.utcnow().isoformat()
     thread_id = str(uuid.uuid4())
     session_id = str(uuid.uuid4())
@@ -176,6 +187,17 @@ def _send_message(
     message = (body.get("message") or "").strip()
     if not message:
         return _response(400, {"error": "message is required"})
+
+    # Bound message size before it's persisted and replayed into future
+    # invocations' history. Without this, a single huge message inflates
+    # every subsequent Bedrock call for the thread (denial-of-wallet) and
+    # can push the conversation-store item toward DynamoDB's 400KB limit.
+    MAX_MESSAGE_LENGTH = 8000
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return _response(
+            400,
+            {"error": f"message must be {MAX_MESSAGE_LENGTH} characters or fewer"},
+        )
 
     thread = _load_owned_thread(user_id, thread_id)
     if not thread:
@@ -252,7 +274,7 @@ def _load_owned_thread(user_id: str, thread_id: str) -> Optional[Dict[str, Any]]
     """Return the thread record only if `user_id` owns it."""
     resp = threads_table.get_item(Key={"threadId": thread_id})
     item = resp.get("Item")
-    if not item or item.get("userId") != user_id:
+    if not is_owner(item, user_id):
         return None
     return item
 

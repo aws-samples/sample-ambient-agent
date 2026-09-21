@@ -1,18 +1,29 @@
 #!/bin/bash
 
 # Agent Core Deployment Script
-# Extracted from master deployment script
-# Deploys only the Bedrock Agent Core component
-
+#
+# Deploys the agent via the `@aws/agentcore` CLI (npm package) against
+# the sibling AgentCore project at `../AmbientAgent` (relative to this
+# script's own directory, i.e. `agent/../AmbientAgent`). On first run,
+# this script creates that project itself (a `byo` runtime pointed at
+# this `agent/` directory's `agent.py`) and creates a scoped IAM
+# execution role, pinning it into the project's `agentcore.json`
+# rather than letting the CLI create its own, broader default role.
+# Both are reused on subsequent runs; `attach_agent_policies.sh` keeps
+# the role's permissions in sync with `policies/*.json` on every run.
+#
 set -e  # Exit on any error
 
-# When the caller passes --agent-arn, we redeploy in place against the
-# existing AgentCore runtime with that ARN. No-arg = fresh deployment
-# using whatever name is in .bedrock_agentcore.yaml (or a prompt if the
-# file is absent). The ARN's runtime name is derived from the last
-# slash-segment of the ARN: e.g. `agent_1-4mH5Mr5ndW` from
-# `arn:aws:bedrock-agentcore:us-west-2:123:runtime/agent_1-4mH5Mr5ndW`.
-AGENT_ARN=""
+# Directory of this script (works regardless of the caller's cwd).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The AgentCore CLI project lives as a sibling of this `agent/`
+# directory, not inside it - creating/importing an AgentCore project
+# nested inside the directory it points its `codeLocation` at triggers
+# a real bug in the CLI (infinite recursive directory copy). Override
+# with AGENTCORE_PROJECT_DIR if you've placed the project elsewhere.
+PROJECT_DIR="${AGENTCORE_PROJECT_DIR:-$SCRIPT_DIR/../AmbientAgent}"
+AGENT_NAME="${AGENTCORE_AGENT_NAME:-ambient}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -43,6 +54,27 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Guard against a Python virtualenv's own `agentcore` console-script
+# (from the old bedrock-agentcore-starter-toolkit package) shadowing
+# the real npm-distributed `@aws/agentcore` CLI on PATH. Their CLIs
+# are entirely different (this script's flags, like `--no-agent`,
+# don't exist on the old one) - if a venv is active ahead of the npm
+# CLI, every subsequent `agentcore` call in this script would run the
+# wrong tool with confusing "no such option" errors.
+check_agentcore_cli() {
+    local resolved
+    resolved="$(command -v agentcore)"
+    case "$resolved" in
+        */.venv/bin/agentcore | */venv/bin/agentcore)
+            log_error "'agentcore' on PATH resolves to $resolved,"
+            log_error "which is the old Python toolkit's CLI, not the npm-distributed"
+            log_error "'@aws/agentcore' CLI this script requires. Deactivate the active"
+            log_error "virtualenv ('deactivate') before running this script, or open a new shell."
+            exit 1
+            ;;
+    esac
+}
+
 # Function to check prerequisites for agent deployment
 check_prerequisites() {
     log "Checking prerequisites for agent deployment..."
@@ -52,9 +84,14 @@ check_prerequisites() {
     for cmd in "${required_commands[@]}"; do
         if ! command_exists "$cmd"; then
             log_error "Required command '$cmd' not found. Please install it first."
+            if [ "$cmd" = "agentcore" ]; then
+                log "Install with: npm install -g @aws/agentcore@latest"
+            fi
             exit 1
         fi
     done
+
+    check_agentcore_cli
 
     # Check AWS credentials
     if ! aws sts get-caller-identity >/dev/null 2>&1; then
@@ -63,20 +100,85 @@ check_prerequisites() {
     fi
 
     # Check for .env file
-    if [ ! -f ".env" ]; then
-        log_error ".env file not found in project root. Please create it from env.example."
+    if [ ! -f "$SCRIPT_DIR/.env" ]; then
+        log_error ".env file not found in agent directory. Please create it from .env.example."
         exit 1
     fi
 
     log_success "Prerequisites check passed"
 }
 
+# Function to create the sibling AgentCore CLI project if it doesn't
+# exist yet, so a first-time run of this script needs nothing beyond
+# `.env` set up. Safe to call on every run - it's a no-op once
+# agentcore.json exists.
+bootstrap_agentcore_project() {
+    if [ -f "$PROJECT_DIR/agentcore/agentcore.json" ]; then
+        return 0
+    fi
+
+    log "AgentCore project not found at $PROJECT_DIR - creating it now..."
+
+    local parent_dir project_name rel_code_location
+    parent_dir="$(dirname "$PROJECT_DIR")"
+    project_name="$(basename "$PROJECT_DIR")"
+    mkdir -p "$parent_dir"
+
+    # Creating/importing an AgentCore project nested inside this
+    # directory (the one its `codeLocation` points at) triggers a real
+    # bug in the CLI (infinite recursive directory copy). Compare
+    # resolved (`..`-free) absolute paths, not raw strings - PROJECT_DIR
+    # defaults to "$SCRIPT_DIR/../AmbientAgent", which literally starts
+    # with "$SCRIPT_DIR/" even though it resolves to a sibling.
+    local resolved_parent_dir
+    resolved_parent_dir="$(cd "$parent_dir" && pwd)"
+    case "$resolved_parent_dir" in
+        "$SCRIPT_DIR" | "$SCRIPT_DIR"/*)
+            log_error "AGENTCORE_PROJECT_DIR/--project-dir ($PROJECT_DIR) resolves to"
+            log_error "$resolved_parent_dir/$project_name, which is nested inside this agent/"
+            log_error "directory. That triggers a CLI bug (infinite recursive directory copy)"
+            log_error "because the project's codeLocation points at its own ancestor."
+            log_error "Point --project-dir at a sibling directory instead."
+            exit 1
+            ;;
+    esac
+
+    # Path to this agent/ directory, relative to the new project
+    # directory - agentcore.json stores codeLocation as a relative
+    # path (e.g. "../agent"), and computing it rather than assuming
+    # "../agent" keeps this working if --project-dir isn't a direct
+    # sibling.
+    rel_code_location=$(python3 -c "
+import os, sys
+print(os.path.relpath(sys.argv[1], sys.argv[2]))
+" "$SCRIPT_DIR" "$PROJECT_DIR" 2>/dev/null)
+    if [ -z "$rel_code_location" ]; then
+        log_error "Could not compute a relative path from $PROJECT_DIR to $SCRIPT_DIR"
+        exit 1
+    fi
+
+    if ! (
+        cd "$parent_dir" \
+        && agentcore create --project-name "$project_name" --no-agent --skip-git --output-dir . \
+        && cd "$project_name" \
+        && agentcore add agent --name "$AGENT_NAME" --type byo \
+            --code-location "$rel_code_location" --entrypoint agent.py --language Python \
+            --framework LangChain_LangGraph --model-provider Bedrock
+    ); then
+        log_error "Failed to bootstrap the AgentCore project at $PROJECT_DIR"
+        log "You can retry this script, or run the steps manually - see agent/README.md."
+        exit 1
+    fi
+
+    log_success "Created AgentCore project at $PROJECT_DIR"
+}
+
 # Function to source environment variables
 source_env() {
     log "Loading environment variables from .env..."
-    if [ -f ".env" ]; then
+    if [ -f "$SCRIPT_DIR/.env" ]; then
         set -a
-        source .env
+        source "$SCRIPT_DIR/.env"
         set +a
         log_success "Environment variables loaded"
         log "Using AWS Account ID: $AWS_ACCOUNT_ID"
@@ -88,141 +190,31 @@ source_env() {
 }
 
 # Function to attach IAM policies to agent role
+#
+# The runtime is deployed against a pre-existing role pinned via
+# `executionRoleArn` in agentcore.json (not a CLI-managed default
+# role), so this step always runs to keep that role's inline policy in
+# sync with agent/policies/*.json - the CLI does not manage this
+# role's permissions for us.
 attach_agent_policies() {
     log "========================================="
     log "ATTACHING IAM POLICIES TO AGENT ROLE"
     log "========================================="
 
-    # Save current directory
     local ORIGINAL_DIR="$(pwd)"
+    cd "$SCRIPT_DIR"
 
-    # Navigate to agent directory if needed
-    if [ ! -f "attach_agent_policies.sh" ]; then
-        if [ -f "agent/attach_agent_policies.sh" ]; then
-            cd agent
-        else
-            log_warning "Policy attachment script not found. Skipping policy attachment."
-            log "To attach policies later, run: cd agent && ./attach_agent_policies.sh"
-            return 0
-        fi
-    fi
-
-    # Make script executable if not already
     chmod +x attach_agent_policies.sh 2>/dev/null || true
 
-    # Run the policy attachment script
     log "Running policy attachment script..."
-    if ./attach_agent_policies.sh; then
+    if ./attach_agent_policies.sh "$EXECUTION_ROLE_ARN"; then
         log_success "Policies attached successfully"
     else
-        log_warning "Policy attachment failed or was skipped"
-        log "You can manually attach policies later by running: cd agent && ./attach_agent_policies.sh"
+        log_warning "Policy attachment failed"
+        log "You can manually attach policies later by running: cd agent && ./attach_agent_policies.sh <role-arn-or-name>"
     fi
 
-    # Return to original directory
     cd "$ORIGINAL_DIR"
-}
-
-# Function to purge stale agent entries from `.bedrock_agentcore.yaml`.
-#
-# `.bedrock_agentcore.yaml` accumulates every agent the user has ever
-# configured locally. If the corresponding AgentCore runtime has since
-# been deleted in AWS, `agentcore launch --auto-update-on-conflict`
-# will try to update a non-existent runtime and bail out with
-# ResourceNotFoundException. This function calls ListAgentRuntimes in
-# the stack's region, compares the live set against what the yaml
-# claims, and rewrites the yaml so only live entries remain. If the
-# `default_agent` pointer becomes stale, it is reset to the first live
-# entry (or removed, triggering agentcore's first-run flow).
-purge_stale_agent_entries() {
-    if [ ! -f ".bedrock_agentcore.yaml" ]; then
-        return 0
-    fi
-
-    log "Checking .bedrock_agentcore.yaml for stale agent entries..."
-
-    local region="${AWS_DEFAULT_REGION:-us-west-2}"
-    local live_ids
-    # Distinguish "list call failed" from "list call returned no
-    # runtimes". Empty output with exit 0 means the account has zero
-    # live agents, so ALL recorded yaml entries are stale. Only treat a
-    # non-zero exit as "leave the yaml alone".
-    if ! live_ids=$(aws bedrock-agentcore-control list-agent-runtimes \
-            --region "$region" \
-            --query 'agentRuntimes[].agentRuntimeId' \
-            --output text 2>/dev/null); then
-        log_warning "Could not list live AgentCore runtimes; leaving yaml untouched"
-        return 0
-    fi
-
-    python - "$live_ids" <<'PY'
-import sys
-
-try:
-    import yaml
-except ImportError:
-    # No PyYAML; leave the file alone rather than corrupt it.
-    sys.exit(0)
-
-live = set(sys.argv[1].split())
-path = ".bedrock_agentcore.yaml"
-with open(path, "r", encoding="utf-8") as fh:
-    doc = yaml.safe_load(fh) or {}
-
-agents = doc.get("agents", {}) or {}
-
-# If the yaml is already in a "no agents" state (e.g., a prior run
-# failed mid-way leaving `agents: {}`), delete the file so the
-# agentcore CLI runs its first-time flow. `agents: {}` + missing
-# default_agent is a fatal state for the CLI.
-if not agents:
-    import os as _os
-    _os.remove(path)
-    print("Removed empty .bedrock_agentcore.yaml (no agents recorded)")
-    sys.exit(0)
-
-kept, dropped = {}, []
-for name, entry in agents.items():
-    agent_id = (entry.get("bedrock_agentcore") or {}).get("agent_id") or ""
-    if agent_id and agent_id in live:
-        kept[name] = entry
-    else:
-        dropped.append((name, agent_id or "<no-id>"))
-
-if not dropped:
-    sys.exit(0)
-
-print("Dropping stale agent entries:")
-for name, agent_id in dropped:
-    print(f"  - {name} (agent_id={agent_id})")
-
-doc["agents"] = kept
-
-# If default_agent points at something we just removed, pick a new
-# default or remove the key entirely so agentcore's first-run flow
-# triggers cleanly.
-default_name = doc.get("default_agent")
-if default_name and default_name not in kept:
-    if kept:
-        doc["default_agent"] = next(iter(kept))
-        print(f"Reset default_agent -> {doc['default_agent']}")
-    else:
-        doc.pop("default_agent", None)
-        print("Cleared default_agent (no live entries remain)")
-
-# If the purge left the config with zero agents, the safest thing is
-# to remove the config file entirely. AgentCore's CLI treats an
-# `agents: {}` / missing `default_agent` combo as a fatal state
-# (`ValueError: No agent specified and no default set`), whereas a
-# missing config file triggers its normal first-run flow cleanly.
-import os
-if not kept:
-    os.remove(path)
-    print("Removed empty .bedrock_agentcore.yaml so agentcore can start fresh")
-else:
-    with open(path, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(doc, fh, sort_keys=False)
-PY
 }
 
 # Function to deploy agent core
@@ -231,146 +223,172 @@ deploy_agent() {
     log "DEPLOYING AGENT CORE"
     log "========================================="
 
-    # Get the current directory
-    CURRENT_DIR="$(pwd)"
-    log "Current directory: $CURRENT_DIR"
+    log "AgentCore project: $PROJECT_DIR"
+    cd "$PROJECT_DIR"
 
-    # Check if we're already in an agent directory (contains agent.py)
-    if [ -f "agent.py" ]; then
-        log "Found agent.py in current directory - proceeding with deployment"
-    else
-        # Look for agent directory
-        if [ -d "agent" ]; then
-            log "Found agent directory, changing to it"
-            cd agent
-        else
-            log_error "Could not find agent directory or agent.py file"
-            log "Please run this script from the project root or from within the agent directory"
-            exit 1
-        fi
-    fi
-
-    log "Agent directory: $(pwd)"
-
-    # Verify agent.py exists
-    if [ ! -f "agent.py" ]; then
-        log_error "agent.py not found in $(pwd)"
+    log "Validating project configuration..."
+    if ! agentcore validate; then
+        log_error "agentcore.json failed validation - fix it before deploying"
         exit 1
     fi
 
-    # Check if agent is already configured
-    if [ -f ".bedrock_agentcore.yaml" ]; then
-        log_warning "Agent appears to be already configured. Checking current status..."
+    log "Deploying via 'agentcore deploy'..."
+    # -y: auto-confirm, read credentials from env (matches this
+    # script's non-interactive usage everywhere else).
+    agentcore deploy -y
 
-        # Extract current agent ARN from config for agent specifically
-        CURRENT_AGENT_ARN=$(awk '/agents:/,/agent:/ {next} /agent:/,/ambient_agent:/ { if (/agent_arn:/) print $2; exit }' .bedrock_agentcore.yaml)
-        if [ -n "$CURRENT_AGENT_ARN" ]; then
-            log "Current agent ARN: $CURRENT_AGENT_ARN"
-        fi
-    fi
+    log "Fetching deployed resource status..."
+    STATUS_JSON=$(agentcore status --runtime "$AGENT_NAME" --json 2>/dev/null || true)
 
-    # Prune any recorded agents whose runtimes no longer exist in AWS.
-    # This avoids `agentcore launch` failing with
-    # ResourceNotFoundException when the user deleted an agent from the
-    # AWS console but the yaml still references it.
-    purge_stale_agent_entries
-
-    # If the caller passed --agent-arn, derive the agent name from the
-    # ARN and feed it to `agentcore configure` non-interactively so the
-    # subsequent `agentcore launch` updates the existing runtime in
-    # place instead of creating a new one.
-    #
-    # AgentCore ARNs have the shape
-    # `.../runtime/<name>-<unique-suffix>`. The unique suffix is
-    # AWS-assigned and alphanumeric; the <name> portion is whatever the
-    # user chose (alphanumeric + underscore, no hyphens allowed by
-    # `agentcore configure`'s validator). So we split on the last
-    # hyphen to recover the original name rather than taking the whole
-    # last slash-segment.
-    if [ -n "$AGENT_ARN" ]; then
-        RUNTIME_SEGMENT=$(echo "$AGENT_ARN" | awk -F'/' '{print $NF}')
-        if [ -z "$RUNTIME_SEGMENT" ]; then
-            log_error "Could not derive agent name from --agent-arn: $AGENT_ARN"
-            exit 1
-        fi
-        # Strip the trailing `-<suffix>` to get the configurable name.
-        TARGET_AGENT_NAME="${RUNTIME_SEGMENT%-*}"
-        if [ -z "$TARGET_AGENT_NAME" ] || [ "$TARGET_AGENT_NAME" = "$RUNTIME_SEGMENT" ]; then
-            log_error "ARN did not match expected AgentCore runtime shape: $AGENT_ARN"
-            log_error "Expected `.../runtime/<name>-<suffix>`"
-            exit 1
-        fi
-        log "Redeploying to existing runtime (name=$TARGET_AGENT_NAME, arn=$AGENT_ARN)"
-        log "Configuring agent (non-interactive, name=$TARGET_AGENT_NAME)..."
-        agentcore configure -e agent.py -n "$TARGET_AGENT_NAME"
-    else
-        log "Configuring agent..."
-        agentcore configure -e agent.py
-    fi
-
-    log "Launching agent..."
-    agentcore launch --auto-update-on-conflict
-
-    # Extract the ARN for the agent we just deployed.
-    #
-    # `.bedrock_agentcore.yaml` lists every agent the user has ever
-    # configured in this directory, not just the current one. Naively
-    # grepping for `agent_arn:` returns all of them. Instead, read the
-    # yaml, find the entry whose key matches `default_agent` (which
-    # agentcore sets to the agent just configured) and pull its ARN.
-    if [ ! -f ".bedrock_agentcore.yaml" ]; then
-        log_error "Agent configuration file not found after deployment"
-        exit 1
-    fi
-
-    NEW_AGENT_ARN=$(python - <<'PY'
-import sys
+    # Best-effort extraction: try a few plausible field names since the
+    # CLI's `status --json` resource shape isn't guaranteed stable
+    # across versions. If none match, fall back to printing the raw
+    # JSON so the user can find the ARN by eye rather than the script
+    # silently claiming success with no ARN.
+    NEW_AGENT_ARN=""
+    if [ -n "$STATUS_JSON" ]; then
+        NEW_AGENT_ARN=$(echo "$STATUS_JSON" | python3 -c "
+import json, sys
 try:
-    import yaml  # PyYAML ships with most Python distributions used here
-except ImportError:
-    print("", end="")
+    data = json.load(sys.stdin)
+except Exception:
     sys.exit(0)
-
-with open(".bedrock_agentcore.yaml", "r", encoding="utf-8") as fh:
-    doc = yaml.safe_load(fh) or {}
-
-default_name = doc.get("default_agent")
-agents = doc.get("agents", {}) or {}
-entry = agents.get(default_name, {}) if default_name else {}
-arn = (entry.get("bedrock_agentcore") or {}).get("agent_arn", "")
-print(arn)
-PY
-    )
-
-    # Fallback: if PyYAML is not available, pick the ARN associated with
-    # the default_agent key via grep + awk. Handles the common case
-    # where the yaml only has one agent too.
-    if [ -z "$NEW_AGENT_ARN" ]; then
-        DEFAULT_AGENT=$(grep '^default_agent:' .bedrock_agentcore.yaml | sed 's/default_agent: *//' | tr -d ' ')
-        if [ -n "$DEFAULT_AGENT" ]; then
-            NEW_AGENT_ARN=$(awk -v target="$DEFAULT_AGENT" '
-                $0 ~ "^  " target ":$" { in_agent=1; next }
-                in_agent && /^  [a-zA-Z_]+:$/ && $0 !~ "^  " target ":$" { in_agent=0 }
-                in_agent && /agent_arn:/ {
-                    sub(/.*agent_arn: */, "")
-                    gsub(/[[:space:]]/, "")
-                    print
-                    exit
-                }
-            ' .bedrock_agentcore.yaml)
-        fi
+resources = data.get('resources', []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+for r in resources:
+    if not isinstance(r, dict):
+        continue
+    name_match = r.get('name') == '$AGENT_NAME' or r.get('resourceName') == '$AGENT_NAME'
+    if name_match:
+        arn = r.get('arn') or r.get('runtimeArn') or r.get('agentRuntimeArn') or ''
+        if arn:
+            print(arn)
+            break
+" 2>/dev/null || true)
     fi
 
     if [ -n "$NEW_AGENT_ARN" ]; then
         log_success "Agent deployed successfully with ARN: $NEW_AGENT_ARN"
         export INVOKE_AGENT_ARN="$NEW_AGENT_ARN"
     else
-        log_error "Failed to extract agent ARN from configuration"
+        log_warning "Could not automatically extract the runtime ARN."
+        log "Run 'agentcore status --runtime $AGENT_NAME --json' from $PROJECT_DIR and look for the runtime's ARN, or run 'agentcore fetch access --name $AGENT_NAME --type agent'."
+        if [ -n "$STATUS_JSON" ]; then
+            echo "$STATUS_JSON"
+        fi
+    fi
+
+    cd "$SCRIPT_DIR"
+    log_success "Agent Core deployment completed"
+}
+
+# Function to read the pinned execution role ARN out of agentcore.json.
+# Creates the role (and pins it into agentcore.json) if none is set yet,
+# so a genuinely from-scratch checkout deploys without requiring the
+# user to hand-create or hand-paste an IAM role first. Sets the global
+# EXECUTION_ROLE_ARN for attach_agent_policies/deploy_agent to use.
+resolve_execution_role() {
+    EXECUTION_ROLE_ARN=$(python3 -c "
+import json
+with open('$PROJECT_DIR/agentcore/agentcore.json', encoding='utf-8') as fh:
+    doc = json.load(fh)
+for rt in doc.get('runtimes', []):
+    if rt.get('name') == '$AGENT_NAME':
+        print(rt.get('executionRoleArn', ''))
+        break
+" 2>/dev/null || true)
+
+    if [ -n "$ROLE_ARN_OVERRIDE" ]; then
+        EXECUTION_ROLE_ARN="$ROLE_ARN_OVERRIDE"
+        log "Using --role-arn override: $EXECUTION_ROLE_ARN"
+    elif [ -z "$EXECUTION_ROLE_ARN" ]; then
+        log_warning "No executionRoleArn set for runtime '$AGENT_NAME' - creating one."
+        EXECUTION_ROLE_ARN=$(create_execution_role)
+        pin_execution_role "$EXECUTION_ROLE_ARN"
+    fi
+
+    log "Execution role: $EXECUTION_ROLE_ARN"
+}
+
+# Function to create the AgentCore Runtime execution role from
+# scratch: a role trusted only by bedrock-agentcore.amazonaws.com for
+# *this* account/region, with no permissions attached yet
+# (attach_agent_policies fills those in from agent/policies/*.json,
+# including the runtime baseline every AgentCore runtime needs to boot
+# - ECR image pull, workload identity token, X-Ray/CloudWatch metrics,
+# log group access). Prints the new role's ARN on stdout.
+create_execution_role() {
+    local role_name="AmbientAgentCoreExecutionRole-${AWS_DEFAULT_REGION}"
+    local trust_policy
+    trust_policy=$(mktemp)
+    cat >"$trust_policy" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowBedrockAgentCoreAssumeRole",
+      "Effect": "Allow",
+      "Principal": { "Service": "bedrock-agentcore.amazonaws.com" },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": { "aws:SourceAccount": "${AWS_ACCOUNT_ID}" },
+        "ArnLike": { "aws:SourceArn": "arn:aws:bedrock-agentcore:${AWS_DEFAULT_REGION}:${AWS_ACCOUNT_ID}:*" }
+      }
+    }
+  ]
+}
+EOF
+
+    local existing_arn
+    existing_arn=$(aws iam get-role --role-name "$role_name" --query 'Role.Arn' --output text 2>/dev/null || true)
+    if [ -n "$existing_arn" ] && [ "$existing_arn" != "None" ]; then
+        log "Reusing existing role: $existing_arn" >&2
+        rm -f "$trust_policy"
+        echo "$existing_arn"
+        return 0
+    fi
+
+    log "Creating IAM role '$role_name'..." >&2
+    local role_arn
+    role_arn=$(aws iam create-role \
+        --role-name "$role_name" \
+        --assume-role-policy-document "file://$trust_policy" \
+        --description "Bedrock AgentCore Runtime execution role for the $AGENT_NAME agent" \
+        --query 'Role.Arn' --output text)
+    rm -f "$trust_policy"
+
+    if [ -z "$role_arn" ]; then
+        log_error "Failed to create IAM role '$role_name'" >&2
         exit 1
     fi
 
-    # Stay in agent directory for policy attachment
-    log_success "Agent Core deployment completed"
+    log_success "Created role: $role_arn" >&2
+    log "Waiting for IAM role propagation..." >&2
+    sleep 10
+
+    echo "$role_arn"
+}
+
+# Function to write executionRoleArn onto the runtime entry in
+# agentcore.json so subsequent runs (and `agentcore deploy` itself)
+# pick it up without re-creating a role every time.
+pin_execution_role() {
+    local role_arn="$1"
+    python3 -c "
+import json
+path = '$PROJECT_DIR/agentcore/agentcore.json'
+with open(path, encoding='utf-8') as fh:
+    doc = json.load(fh)
+for rt in doc.get('runtimes', []):
+    if rt.get('name') == '$AGENT_NAME':
+        rt['executionRoleArn'] = '$role_arn'
+        break
+else:
+    raise SystemExit(f\"No runtime named '$AGENT_NAME' in {path}\")
+with open(path, 'w', encoding='utf-8') as fh:
+    json.dump(doc, fh, indent=2)
+    fh.write('\n')
+"
+    log_success "Pinned executionRoleArn in $PROJECT_DIR/agentcore/agentcore.json"
 }
 
 # Function to verify agent deployment
@@ -379,22 +397,16 @@ verify_agent_deployment() {
     log "VERIFYING AGENT DEPLOYMENT"
     log "========================================="
 
-    # Check agent status
-    log "Checking agent status..."
-    if [ -n "$INVOKE_AGENT_ARN" ]; then
-        log_success "Agent ARN: $INVOKE_AGENT_ARN"
-
-        # Test if agent is accessible
-        log "Testing agent accessibility..."
-        if aws bedrock-agent get-agent --agent-id $(echo $INVOKE_AGENT_ARN | cut -d'/' -f2) >/dev/null 2>&1; then
-            log_success "Agent is accessible and ready"
-        else
-            log_warning "Agent may not be fully ready yet (this is normal for new deployments)"
-        fi
-    else
-        log_error "Agent ARN not found in environment"
-        exit 1
+    if [ -z "$INVOKE_AGENT_ARN" ]; then
+        log_warning "Agent ARN was not captured automatically; skipping automated verification."
+        log "Run 'agentcore status --runtime $AGENT_NAME' from $PROJECT_DIR to check deployment status."
+        return 0
     fi
+
+    log_success "Agent ARN: $INVOKE_AGENT_ARN"
+    log "Checking agent status via the CLI..."
+    (cd "$PROJECT_DIR" && agentcore status --runtime "$AGENT_NAME") || \
+        log_warning "Could not confirm status automatically (this is not necessarily an error - new deployments can take a moment to report READY)."
 }
 
 # Function to display agent deployment summary
@@ -410,6 +422,7 @@ display_summary() {
     if [ -n "$INVOKE_AGENT_ARN" ]; then
         echo -e "${GREEN}Agent ARN:${NC} $INVOKE_AGENT_ARN"
     fi
+    echo -e "${GREEN}Execution role:${NC} $EXECUTION_ROLE_ARN"
 
     echo ""
     log "Next steps:"
@@ -417,8 +430,8 @@ display_summary() {
     echo "2. Navigate to the Agents page in the web application"
     echo "3. Click 'Register New Agent' and paste the ARN"
     echo ""
-    log "To test the agent directly:"
-    echo "aws bedrock-agent-runtime invoke-agent --agent-id \$(echo $INVOKE_AGENT_ARN | cut -d'/' -f2) --agent-alias-id TSTALIASID --session-id test-session --input-text 'Hello, how are you?'"
+    log "To invoke the agent directly:"
+    echo "  (cd $PROJECT_DIR && agentcore invoke \"Hello, how are you?\")"
     echo ""
 }
 
@@ -441,7 +454,19 @@ main() {
 
     # Run deployment steps
     check_prerequisites
+    bootstrap_agentcore_project
     source_env
+    resolve_execution_role
+
+    if [ "$POLICIES_ONLY" = "true" ]; then
+        # Re-sync the execution role's IAM policy from agent/policies/*.json
+        # without a full `agentcore deploy` - for when only permissions
+        # changed and the runtime itself doesn't need re-provisioning.
+        attach_agent_policies
+        log_success "Policy sync completed successfully at $(date)"
+        return 0
+    fi
+
     deploy_agent
     attach_agent_policies
     verify_agent_deployment
@@ -450,6 +475,11 @@ main() {
     log_success "Agent deployment completed successfully at $(date)"
 }
 
+# Global set by resolve_execution_role / --role-arn.
+EXECUTION_ROLE_ARN=""
+ROLE_ARN_OVERRIDE=""
+POLICIES_ONLY="false"
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -457,41 +487,74 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Agent Core Deployment Script"
-            echo "Deploys the Bedrock Agent Core component."
+            echo "Deploys the agent via the '@aws/agentcore' CLI (agentcore deploy)"
+            echo "against the sibling AgentCore project at ../AmbientAgent."
             echo ""
             echo "Options:"
-            echo "  --agent-arn <ARN>   Redeploy to an existing AgentCore runtime."
-            echo "                      The runtime name is taken from the ARN's"
-            echo "                      last slash-segment. The ARN is preserved;"
-            echo "                      only the code/version is updated."
+            echo "  --role-arn <ARN>    Execution role to use if agentcore.json's"
+            echo "                      runtime entry has no executionRoleArn set."
+            echo "  --project-dir <dir> AgentCore project directory (default: ../AmbientAgent)."
+            echo "  --agent-name <name> Runtime name within the project (default: ambient)."
+            echo "  --policies-only     Re-sync the execution role's IAM policy from"
+            echo "                      agent/policies/*.json without a full 'agentcore deploy'."
+            echo "                      Use this after editing a policies/*.json file when the"
+            echo "                      runtime itself doesn't need re-provisioning."
             echo "  --help, -h          Show this help message"
             echo ""
             echo "Prerequisites:"
-            echo "  - AWS CLI configured with appropriate credentials"
-            echo "  - agentcore CLI tool installed"
-            echo "  - .env file present in project root"
+            echo "  - AWS CLI and the 'agentcore' npm CLI installed"
+            echo "    (npm install -g @aws/agentcore@latest)"
+            echo "  - .env file present in this (agent/) directory"
             echo ""
-            echo "Behavior:"
-            echo "  Without --agent-arn, this script creates a new runtime (or"
-            echo "  updates whatever is already pinned in .bedrock_agentcore.yaml)."
-            echo "  With --agent-arn, it updates the referenced runtime in place."
+            echo "On first run, this script creates the AgentCore project at --project-dir"
+            echo "(a 'byo' runtime pointed at this agent/ directory) and an IAM execution"
+            echo "role scoped to agent/policies/*.json, if they don't already exist."
             echo ""
             echo "Examples:"
             echo "  $0"
-            echo "  $0 --agent-arn arn:aws:bedrock-agentcore:us-west-2:123:runtime/agent_1-4mH5Mr5ndW"
+            echo "  $0 --policies-only"
+            echo "  $0 --role-arn arn:aws:iam::123456789012:role/MyAgentRole"
             echo ""
             exit 0
             ;;
-        --agent-arn)
+        --policies-only)
+            POLICIES_ONLY="true"
+            shift
+            ;;
+        --role-arn)
             if [ -z "${2:-}" ]; then
-                log_error "--agent-arn requires a value"
+                log_error "--role-arn requires a value"
                 exit 1
             fi
-            AGENT_ARN="$2"
+            ROLE_ARN_OVERRIDE="$2"
             shift 2
             ;;
-        --agent-arn=*)
-            AGENT_ARN="${1#--agent-arn=}"
+        --role-arn=*)
+            ROLE_ARN_OVERRIDE="${1#--role-arn=}"
+            shift
+            ;;
+        --project-dir)
+            if [ -z "${2:-}" ]; then
+                log_error "--project-dir requires a value"
+                exit 1
+            fi
+            PROJECT_DIR="$2"
+            shift 2
+            ;;
+        --project-dir=*)
+            PROJECT_DIR="${1#--project-dir=}"
+            shift
+            ;;
+        --agent-name)
+            if [ -z "${2:-}" ]; then
+                log_error "--agent-name requires a value"
+                exit 1
+            fi
+            AGENT_NAME="$2"
+            shift 2
+            ;;
+        --agent-name=*)
+            AGENT_NAME="${1#--agent-name=}"
             shift
             ;;
         *)

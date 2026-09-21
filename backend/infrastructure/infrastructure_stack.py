@@ -37,14 +37,34 @@ class InfrastructureStack(Stack):
             user_pool_name=f"{self.config.stack_name}-user-pool",
             removal_policy=RemovalPolicy.DESTROY,
             self_sign_up_enabled=False,
-            auto_verify=cognito.AutoVerifiedAttrs(email=True, phone=True),
+            # Phone auto-verify removed: sign-in only ever uses email
+            # (`sign_in_aliases` below), so verifying phone numbers was
+            # unused - but its presence makes CDK/Cognito provision an
+            # SMS-sending configuration on the pool. That SMS config
+            # then conflicts with `mfa_second_factor(sms=False)` below:
+            # Cognito refuses "turn off SMS_MFA while SMS configuration
+            # is set" on an update. Dropping phone verification removes
+            # the SMS config so TOTP-only optional MFA can deploy.
+            auto_verify=cognito.AutoVerifiedAttrs(email=True),
             sign_in_aliases=cognito.SignInAliases(email=True),
             password_policy=cognito.PasswordPolicy(
-                min_length=8,
+                min_length=12,
                 require_lowercase=True,
                 require_uppercase=True,
                 require_digits=True,
                 require_symbols=True,
+            ),
+            # Optional TOTP MFA. Not REQUIRED because self-signup is
+            # disabled and users are provisioned by an admin (see
+            # _create_cognito_users below), so there's no self-service
+            # enrollment flow to require it against; users can still
+            # turn it on. This satisfies cdk-nag AwsSolutions-COG2's
+            # underlying concern (some MFA path exists) without forcing
+            # every admin-created sample user through TOTP setup before
+            # their first sign-in.
+            mfa=cognito.Mfa.OPTIONAL,
+            mfa_second_factor=cognito.MfaSecondFactor(
+                sms=False, otp=True, email=False
             ),
             # Use the Plus feature plan (replaces the deprecated
             # advanced_security_mode property). Plus tier enables advanced
@@ -56,9 +76,13 @@ class InfrastructureStack(Stack):
         user_pool_client = user_pool.add_client(
             f"{self.config.stack_name}-UserPoolClient",
             generate_secret=False,
+            # SRP-only: the frontend's Amplify `<Authenticator>` uses
+            # USER_SRP_AUTH exclusively, so ADMIN_USER_PASSWORD_AUTH and
+            # USER_PASSWORD_AUTH (both of which send the plaintext
+            # password to Cognito instead of a zero-knowledge proof)
+            # were enabled but unused. Removing them narrows the auth
+            # surface to the flow actually exercised.
             auth_flows=cognito.AuthFlow(
-                admin_user_password=True,
-                user_password=True,
                 user_srp=True,
             ),
         )

@@ -22,6 +22,8 @@ from aws_cdk import (
     aws_cloudfront_origins as origins,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
+    aws_bedrock as bedrock,
+    aws_wafv2 as wafv2,
 )
 
 from cdk_nag import NagSuppressions
@@ -61,6 +63,33 @@ class MultiAgentStack(Stack):
 
         # Create S3 website bucket
         self.website_bucket = self._create_website_bucket()
+
+        # Create the stack-owned bucket that ambient signals (S3 file-
+        # upload triggers) are allowed to watch. Signals can only point
+        # at this bucket (never an arbitrary caller-supplied bucket
+        # name), and the signal management/processor roles' S3
+        # permissions are scoped to match - so attaching a signal never
+        # grants a Lambda invoke permission + notification config
+        # against a bucket outside the platform's control.
+        self.signal_uploads_bucket = self._create_signal_uploads_bucket()
+
+        # Bedrock Guardrail applied by the example agent to every model
+        # invocation. Filters prompt-attack/jailbreak attempts (the
+        # primary risk from feeding untrusted uploaded-file content and
+        # user-supplied signal metadata into the model) plus standard
+        # harmful-content categories. The agent runs outside this CDK
+        # stack (deployed separately via the AgentCore CLI), so the
+        # guardrail's id/version are surfaced as stack outputs for the
+        # agent operator to copy into `agent/config.yaml`.
+        self.agent_guardrail = self._create_agent_guardrail()
+        # A published version (rather than DRAFT) is required to pass
+        # `guardrailVersion` to `ChatBedrock`/`invoke_model`.
+        self.agent_guardrail_version = bedrock.CfnGuardrailVersion(
+            self,
+            f"{self.config.stack_name}-AgentGuardrailVersion",
+            guardrail_identifier=self.agent_guardrail.attr_guardrail_id,
+            description="Published version for the example agent to reference.",
+        )
 
         # Create DynamoDB tables
         self.agent_registry_table = self._create_agent_registry_table()
@@ -197,6 +226,106 @@ class MultiAgentStack(Stack):
             enforce_ssl=True,
             encryption=s3.BucketEncryption.S3_MANAGED,
             server_access_logs_bucket=access_logs_bucket,
+        )
+
+    def _create_signal_uploads_bucket(self) -> s3.Bucket:
+        """Create the single bucket that ambient S3 signals may watch.
+
+        Ambient signals only ever need a bucket for users to upload
+        sample files into so the agent can react to them. Provisioning
+        one bucket per stack (instead of accepting any bucket name from
+        the client) lets every IAM grant downstream be scoped to this
+        bucket's ARN instead of `arn:aws:s3:::*`.
+        """
+        # Deliberately named without a "SignalUploads" prefix: the
+        # physical bucket name this produces (e.g.
+        # `...-uploadslogsdest-xxxx`) needs to be visually
+        # distinguishable at a glance from the real uploads bucket
+        # below, since this bucket has no notification wiring at all -
+        # confusing it with the real uploads target would mean an
+        # upload silently never fires a signal.
+        access_logs_bucket = s3.Bucket(
+            self,
+            f"{self.config.stack_name}-UploadsLogsDestinationBucket",
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+            enforce_ssl=True,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="ExpireAccessLogs",
+                    enabled=True,
+                    expiration=Duration.days(90),
+                    abort_incomplete_multipart_upload_after=Duration.days(1),
+                )
+            ],
+        )
+
+        return s3.Bucket(
+            self,
+            f"{self.config.stack_name}-SignalUploadsBucket",
+            removal_policy=RemovalPolicy.DESTROY,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            auto_delete_objects=True,
+            enforce_ssl=True,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            server_access_logs_bucket=access_logs_bucket,
+            lifecycle_rules=[
+                s3.LifecycleRule(
+                    id="ExpireUploads",
+                    enabled=True,
+                    expiration=Duration.days(30),
+                    abort_incomplete_multipart_upload_after=Duration.days(1),
+                )
+            ],
+        )
+
+    def _create_agent_guardrail(self) -> bedrock.CfnGuardrail:
+        """Create the Bedrock Guardrail the example agent applies to every
+        model invocation.
+
+        `PROMPT_ATTACK` is the content filter most relevant here: the
+        agent feeds uploaded-file content and user-supplied signal
+        metadata/descriptions into the model, both of which are
+        prompt-injection vectors.
+        Per the Bedrock API, PROMPT_ATTACK's `output_strength` must be
+        "NONE" - the filter only evaluates input, not model output.
+        Standard harmful-content filters are included too, at a
+        moderate strength, since they're essentially free once a
+        guardrail exists.
+        """
+        content_filters = [
+            bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                type="PROMPT_ATTACK",
+                input_strength="HIGH",
+                output_strength="NONE",
+            )
+        ]
+        for harmful_category in ("HATE", "INSULTS", "SEXUAL", "VIOLENCE", "MISCONDUCT"):
+            content_filters.append(
+                bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                    type=harmful_category,
+                    input_strength="MEDIUM",
+                    output_strength="MEDIUM",
+                )
+            )
+
+        return bedrock.CfnGuardrail(
+            self,
+            f"{self.config.stack_name}-AgentGuardrail",
+            name=f"{self.config.stack_name}-agent-guardrail",
+            blocked_input_messaging=(
+                "I can't process that request - it looks like it may be "
+                "attempting to override my instructions or contains "
+                "content I'm not able to act on."
+            ),
+            blocked_outputs_messaging=(
+                "I'm not able to share that response."
+            ),
+            content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
+                filters_config=content_filters,
+            ),
         )
 
     def _create_agent_registry_table(self) -> dynamodb.Table:
@@ -411,6 +540,9 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="agent_management.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            # Two weeks is enough for debugging without letting each of
+            # this stack's 9 Lambda log groups grow forever.
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.seconds(30),
             memory_size=256,
             role=lambda_role,
@@ -447,6 +579,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="job_management.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.seconds(30),
             memory_size=256,
             role=lambda_role,
@@ -494,7 +627,13 @@ class MultiAgentStack(Stack):
                     f"arn:aws:bedrock:{self.region}:{self.account}:agent-alias/*/*",
                     f"arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-*",
                     f"arn:aws:bedrock:{self.region}::foundation-model/us.anthropic.claude-*",
-                    f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/*",
+                    # Scoped to cross-region inference profiles whose
+                    # profile id itself starts with the Claude model
+                    # prefix (e.g. `us.anthropic.claude-*`) rather than
+                    # `inference-profile/*`, which would let this role
+                    # invoke a profile fronting any model regardless of
+                    # the "Claude models only" intent.
+                    f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/us.anthropic.claude-*",
                 ],
             )
         )
@@ -535,6 +674,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="job_execution.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.minutes(15),
             memory_size=512,
             role=lambda_role,
@@ -592,6 +732,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="scheduler.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.minutes(5),
             memory_size=256,
             role=lambda_role,
@@ -641,6 +782,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="conversation_management.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.seconds(30),
             memory_size=256,
             role=lambda_role,
@@ -673,7 +815,11 @@ class MultiAgentStack(Stack):
         self.ambient_signals_table.grant_read_write_data(lambda_role)
         self.agent_registry_table.grant_read_data(lambda_role)
 
-        # Grant S3 permissions for managing bucket notifications
+        # Grant S3 permissions for managing bucket notifications, scoped
+        # to the stack-owned signal-uploads bucket only. Signals cannot
+        # be attached to arbitrary buckets (see create_signal's
+        # bucket-name allowlist check), so this grant does not need to
+        # be account-wide.
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
@@ -682,7 +828,7 @@ class MultiAgentStack(Stack):
                     "s3:GetBucketNotification",
                     "s3:PutBucketNotification",
                 ],
-                resources=["arn:aws:s3:::*"],
+                resources=[self.signal_uploads_bucket.bucket_arn],
             )
         )
 
@@ -710,6 +856,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="signal_management.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.seconds(30),
             memory_size=256,
             role=lambda_role,
@@ -718,6 +865,7 @@ class MultiAgentStack(Stack):
                 "AMBIENT_SIGNALS_TABLE": self.ambient_signals_table.table_name,
                 "AGENT_REGISTRY_TABLE": self.agent_registry_table.table_name,
                 "SIGNAL_PROCESSOR_FUNCTION_NAME": f"{self.config.stack_name}-signal-processor",
+                "ALLOWED_SIGNAL_BUCKET": self.signal_uploads_bucket.bucket_name,
                 "REGION": self.region,
             },
         )
@@ -752,7 +900,10 @@ class MultiAgentStack(Stack):
         # auto-execute feature.
         self.job_execution_queue.grant_send_messages(lambda_role)
 
-        # Grant S3 read permissions to access uploaded files if needed
+        # Grant S3 read permissions to access uploaded files, scoped to
+        # the stack-owned signal-uploads bucket only. Signals cannot
+        # point at arbitrary buckets, so this Lambda never needs to
+        # read outside of it.
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
@@ -760,7 +911,7 @@ class MultiAgentStack(Stack):
                     "s3:GetObject",
                     "s3:GetObjectVersion",
                 ],
-                resources=["arn:aws:s3:::*/*"],
+                resources=[f"{self.signal_uploads_bucket.bucket_arn}/*"],
             )
         )
 
@@ -771,6 +922,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="signal_processor.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.seconds(60),
             memory_size=256,
             role=lambda_role,
@@ -864,6 +1016,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="chat_execution.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.minutes(10),
             memory_size=512,
             role=lambda_role,
@@ -908,6 +1061,7 @@ class MultiAgentStack(Stack):
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="chat_management.handler",
             code=_lambda.Code.from_asset("functions/multi_agent"),
+            log_retention=logs.RetentionDays.TWO_WEEKS,
             timeout=Duration.seconds(30),
             memory_size=256,
             role=lambda_role,
@@ -973,6 +1127,136 @@ class MultiAgentStack(Stack):
             validate_request_body=True,
             validate_request_parameters=True,
         )
+
+        # API throttling / usage plan. Attaches an account-wide usage
+        # plan with basic rate/burst/quota limits onto the `prod` stage
+        # instead of relying solely on API Gateway's account-level
+        # defaults.
+        usage_plan = api.add_usage_plan(
+            f"{self.config.stack_name}-MultiAgentUsagePlan",
+            name=f"{self.config.stack_name}-multi-agent-usage-plan",
+            throttle=apigateway.ThrottleSettings(rate_limit=50, burst_limit=100),
+            quota=apigateway.QuotaSettings(
+                limit=100000, period=apigateway.Period.DAY
+            ),
+        )
+        usage_plan.add_api_stage(stage=api.deployment_stage)
+
+        # Optional AWS WAFv2 web ACL, gated behind `enable_waf` in
+        # config.yml since it adds ongoing cost that isn't needed for a
+        # default sample deployment. When enabled, apply AWS-managed
+        # rule groups covering common exploits and known bad IPs, plus
+        # rate limiting per source IP as defense-in-depth alongside the
+        # usage plan above (which limits per-API-key, not per-IP).
+        if self.config.enable_waf:
+            web_acl = wafv2.CfnWebACL(
+                self,
+                f"{self.config.stack_name}-MultiAgentWebAcl",
+                default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
+                scope="REGIONAL",
+                visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                    cloud_watch_metrics_enabled=True,
+                    metric_name=f"{self.config.stack_name}-multi-agent-waf",
+                    sampled_requests_enabled=True,
+                ),
+                rules=[
+                    wafv2.CfnWebACL.RuleProperty(
+                        name="AWSManagedRulesCommonRuleSet",
+                        priority=0,
+                        override_action=wafv2.CfnWebACL.OverrideActionProperty(
+                            none={}
+                        ),
+                        statement=wafv2.CfnWebACL.StatementProperty(
+                            managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
+                                vendor_name="AWS",
+                                name="AWSManagedRulesCommonRuleSet",
+                            )
+                        ),
+                        visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                            cloud_watch_metrics_enabled=True,
+                            metric_name=f"{self.config.stack_name}-common-rule-set",
+                            sampled_requests_enabled=True,
+                        ),
+                    ),
+                    wafv2.CfnWebACL.RuleProperty(
+                        name="AWSManagedRulesKnownBadInputsRuleSet",
+                        priority=1,
+                        override_action=wafv2.CfnWebACL.OverrideActionProperty(
+                            none={}
+                        ),
+                        statement=wafv2.CfnWebACL.StatementProperty(
+                            managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
+                                vendor_name="AWS",
+                                name="AWSManagedRulesKnownBadInputsRuleSet",
+                            )
+                        ),
+                        visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                            cloud_watch_metrics_enabled=True,
+                            metric_name=f"{self.config.stack_name}-known-bad-inputs",
+                            sampled_requests_enabled=True,
+                        ),
+                    ),
+                    wafv2.CfnWebACL.RuleProperty(
+                        name="RateLimitPerIp",
+                        priority=2,
+                        action=wafv2.CfnWebACL.RuleActionProperty(block={}),
+                        statement=wafv2.CfnWebACL.StatementProperty(
+                            rate_based_statement=wafv2.CfnWebACL.RateBasedStatementProperty(
+                                limit=2000,
+                                aggregate_key_type="IP",
+                            )
+                        ),
+                        visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                            cloud_watch_metrics_enabled=True,
+                            metric_name=f"{self.config.stack_name}-rate-limit-per-ip",
+                            sampled_requests_enabled=True,
+                        ),
+                    ),
+                ]
+                + (
+                    [
+                        wafv2.CfnWebACL.RuleProperty(
+                            name="IpAllowList",
+                            priority=3,
+                            action=wafv2.CfnWebACL.RuleActionProperty(
+                                block={}
+                            ),
+                            statement=wafv2.CfnWebACL.StatementProperty(
+                                not_statement=wafv2.CfnWebACL.NotStatementProperty(
+                                    statement=wafv2.CfnWebACL.StatementProperty(
+                                        ip_set_reference_statement=wafv2.CfnWebACL.IPSetReferenceStatementProperty(
+                                            arn=wafv2.CfnIPSet(
+                                                self,
+                                                f"{self.config.stack_name}-MultiAgentIpAllowSet",
+                                                addresses=self.config.ip_allow_list,
+                                                ip_address_version="IPV4",
+                                                scope="REGIONAL",
+                                            ).attr_arn
+                                        )
+                                    )
+                                )
+                            ),
+                            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                                cloud_watch_metrics_enabled=True,
+                                metric_name=f"{self.config.stack_name}-ip-allow-list",
+                                sampled_requests_enabled=True,
+                            ),
+                        )
+                    ]
+                    if self.config.ip_allow_list
+                    else []
+                ),
+            )
+
+            wafv2.CfnWebACLAssociation(
+                self,
+                f"{self.config.stack_name}-MultiAgentWebAclAssociation",
+                resource_arn=(
+                    f"arn:aws:apigateway:{self.region}::/restapis/"
+                    f"{api.rest_api_id}/stages/{api.deployment_stage.stage_name}"
+                ),
+                web_acl_arn=web_acl.attr_arn,
+            )
 
         # Create Cognito authorizer using the passed user pool
         authorizer = None
@@ -1264,6 +1548,43 @@ class MultiAgentStack(Stack):
                 xss_protection=cloudfront.ResponseHeadersXSSProtection(
                     protection=True, mode_block=True, override=True
                 ),
+                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                    # Defense-in-depth for a UI that renders LLM output
+                    # (chat/job responses via react-markdown). No inline
+                    # script/style, no plugins/objects, and framing
+                    # disallowed entirely (frame-ancestors backs up the
+                    # X-Frame-Options DENY above). connect-src covers
+                    # same-origin API calls (proxied through this
+                    # distribution at /prod/*) plus Cognito's IdP/token
+                    # endpoints that Amplify Auth calls directly from
+                    # the browser; img-src allows the AWS sign-in page
+                    # logo asset used in the login layout.
+                    # CSP host-source wildcards are only valid as a
+                    # LEADING label (e.g. `*.example.com`) - a wildcard
+                    # in the middle of a hostname like
+                    # `cognito-idp.*.amazonaws.com` is not valid syntax
+                    # and browsers silently drop that source entry,
+                    # blocking every Cognito call Amplify Auth makes
+                    # (observed as a live CSP violation against
+                    # cognito-idp.<region>.amazonaws.com). Cognito's
+                    # regional endpoints are always
+                    # `<service>.<region>.amazonaws.com`, and this stack
+                    # already knows its own deployment region at synth
+                    # time, so the exact hostnames are generated instead
+                    # of attempted via wildcard.
+                    content_security_policy=(
+                        "default-src 'self'; "
+                        "script-src 'self'; "
+                        "style-src 'self' 'unsafe-inline'; "
+                        "img-src 'self' data: https://*.amazonaws.com; "
+                        f"connect-src 'self' https://cognito-idp.{self.region}.amazonaws.com "
+                        f"https://cognito-identity.{self.region}.amazonaws.com; "
+                        "object-src 'none'; "
+                        "base-uri 'self'; "
+                        "frame-ancestors 'none'"
+                    ),
+                    override=True,
+                ),
             ),
         )
 
@@ -1411,6 +1732,10 @@ function handler(event) {
                     },
                 },
                 "lastUpdated": deployment_timestamp,
+                # Only bucket ambient S3 signals may point at. Surfaced
+                # here so the signals UI can show/prefill it instead of
+                # accepting a free-text bucket name.
+                "signalUploadsBucket": self.signal_uploads_bucket.bucket_name,
             },
         )
 
@@ -1506,6 +1831,37 @@ function handler(event) {
             description="Conversation Store DynamoDB table name",
         )
 
+        CfnOutput(
+            self,
+            "SignalUploadsBucketName",
+            value=self.signal_uploads_bucket.bucket_name,
+            description=(
+                "The only S3 bucket ambient signals may watch. Upload "
+                "sample files here to trigger s3_file_upload signals."
+            ),
+        )
+
+        CfnOutput(
+            self,
+            "AgentGuardrailId",
+            value=self.agent_guardrail.attr_guardrail_id,
+            description=(
+                "Bedrock Guardrail id. Copy into agent/config.yaml's "
+                "aws.bedrock.guardrail_id so the example agent applies "
+                "it to every model invocation."
+            ),
+        )
+
+        CfnOutput(
+            self,
+            "AgentGuardrailVersion",
+            value=self.agent_guardrail_version.attr_version,
+            description=(
+                "Bedrock Guardrail version. Copy into agent/config.yaml's "
+                "aws.bedrock.guardrail_version."
+            ),
+        )
+
         # Store API endpoint in SSM for frontend access
         ssm.StringParameter(
             self,
@@ -1530,8 +1886,61 @@ function handler(event) {
                     ],
                 },
                 {
+                    # Scoped to the exact finding strings cdk-nag emits
+                    # for this stack (confirmed via `cdk synth`) rather
+                    # than a blanket, stack-wide suppression with no
+                    # `appliesTo` - that would silence every current AND
+                    # FUTURE wildcard finding, masking accidental
+                    # over-broad grants added later. Regenerate this
+                    # list with `cdk synth` if resources are added,
+                    # renamed, or reordered.
                     "id": "AwsSolutions-IAM5",
-                    "reason": "Wildcard permissions are scoped to specific resource types: DynamoDB GSI access, Bedrock agents/models/runtimes (account/region scoped), Lambda invoke (specific function ARN), S3 signal processing, and CDK bucket deployment",
+                    "reason": "DynamoDB GSI grants (table + all indexes), S3 bucket-deployment/signal-processing actions scoped to specific buckets, and the CDK asset bucket used by BucketDeployment all require a trailing wildcard by construct design",
+                    "appliesTo": [
+                        "Action::s3:Abort*",
+                        "Action::s3:DeleteObject*",
+                        "Action::s3:GetBucket*",
+                        "Action::s3:GetObject*",
+                        "Action::s3:List*",
+                        "Resource::<reactstarterAgentRegistryTableBB07C774.Arn>/index/*",
+                        "Resource::<reactstarterAmbientSignalsTableF850C89A.Arn>/index/*",
+                        "Resource::<reactstarterChatExecutionFunction41221382.Arn>:*",
+                        "Resource::<reactstarterChatThreadsTableDDAA57CD.Arn>/index/*",
+                        "Resource::<reactstarterConversationStoreTable2E465338.Arn>/index/*",
+                        "Resource::<reactstarterSignalUploadsBucket97B46C5E.Arn>/*",
+                        "Resource::<reactstarterTaskRegistryTableB4A069AD.Arn>/index/*",
+                        "Resource::<reactstarterWebsiteBucket50502CD9.Arn>/*",
+                        # CDK's bootstrap asset bucket. Named
+                        # `cdk-hnb659fds-assets-<account>-<region>` by
+                        # convention; built from account/region tokens
+                        # here rather than hardcoded so this suppression
+                        # doesn't only match the account/region used
+                        # when this list was generated.
+                        f"Resource::arn:aws:s3:::cdk-hnb659fds-assets-{self.account}-{self.region}/*",
+                        # AgentCore runtime ARNs use a literal region
+                        # wildcard (`*`) since the registered runtime may
+                        # live in a different region than this stack -
+                        # cdk-nag renders the account id literally here
+                        # rather than as a CFN token because it's spliced
+                        # into a plain f-string, not a Fn::Sub/Fn::Join.
+                        f"Resource::arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
+                        f"Resource::arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
+                        f"Resource::arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-*",
+                        f"Resource::arn:aws:bedrock:{self.region}::foundation-model/us.anthropic.claude-*",
+                        f"Resource::arn:aws:bedrock:{self.region}:{self.account}:agent-alias/*/*",
+                        f"Resource::arn:aws:bedrock:{self.region}:{self.account}:agent/*",
+                        f"Resource::arn:aws:bedrock:{self.region}:{self.account}:inference-profile/us.anthropic.claude-*",
+                        # CDK's built-in BucketDeployment custom resource
+                        # (react-starter-UserInterfaceDeployment below)
+                        # generates its own Lambda service role with a
+                        # `Resource::*` statement that isn't covered by
+                        # the resource-scoped suppression further down
+                        # despite `apply_to_children=True` - it's on a
+                        # sibling custom-resource-provider construct, not
+                        # a child of `_bucket_deployment` itself. Not
+                        # something this stack's own code grants.
+                        "Resource::*",
+                    ],
                 },
                 {
                     "id": "AwsSolutions-APIG2",

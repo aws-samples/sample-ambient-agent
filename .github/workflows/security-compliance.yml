@@ -34,26 +34,34 @@ jobs:
       actions: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install UV (Python package manager)
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           version: "0.6.0"
 
       - name: Run ASH Security Scan
         run: |
           echo "Running ASH (Automated Security Helper) security analysis..."
-          uvx git+https://github.com/awslabs/automated-security-helper.git --mode precommit
+          # Pinned to a tagged release rather than the mutable `main`
+          # branch: `uvx git+https://...git` with no ref resolves
+          # whatever is at the tip of the default branch at run time,
+          # which is the supply-chain equivalent of `curl | sh` - a
+          # compromised or rewritten upstream `main` would execute in
+          # this workflow with `contents: read` / `security-events:
+          # write` permissions on every push and PR. Bump this tag
+          # deliberately when upgrading.
+          uvx git+https://github.com/awslabs/automated-security-helper.git@v3.7.1 --mode precommit
         continue-on-error: true
 
       - name: Upload ASH Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: ash-security-results
@@ -71,16 +79,16 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
         run: |
-          pip install ferret-scan
+          pip install ferret-scan==2.4.5
 
       - name: Run Ferret Scan
         run: |
@@ -118,7 +126,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Ferret Scan Results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3
         if: always()
         with:
           sarif_file: ferret-scan-results.sarif
@@ -126,7 +134,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload Ferret Scan Results as Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: ferret-scan-results
@@ -141,25 +149,25 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install licensecheck
         run: |
-          pip install licensecheck
+          pip install licensecheck==2026.0.8
 
       - name: Run License Compliance Check
         run: |
           echo "Checking license compliance..."
-          licensecheck --format=ansi --zero
+          licensecheck --format=ansi --zero -r backend/requirements.txt agent/requirements.txt
           echo "✓ All licenses are compliant"
 
       - name: Upload License Report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: license-compliance-report

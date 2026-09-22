@@ -17,3 +17,10 @@ cognito:
   # List of email addresses to create as Cognito users
   users:
     - builder@amazon.com
+
+# Additional AWS regions (beyond this stack's own deploy region) that the
+# job-execution/chat-execution Lambda roles are allowed to call
+# bedrock-agentcore:InvokeAgentRuntime in. Only needed if you register an
+# AgentCore runtime in a different region than this backend stack.
+# allowed_agent_regions:
+#   - us-east-1

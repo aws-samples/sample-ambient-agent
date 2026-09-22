@@ -100,5 +100,9 @@ ignore_licenses = [
 ]
 
 # Packages to ignore (e.g., internal tools, dev-only dependencies)
-# Use this sparingly and document why each package is ignored
-ignore_packages = ["pylint", "astroid"]
+# Use this sparingly and document why each package is ignored.
+# Empty on purpose: pylint/astroid (GPL) were previously ignored here,
+# but they are dev-only tooling and have been moved out of
+# agent/requirements.txt (the file CI actually scans) into
+# requirements-dev.txt, so no exemption is needed anymore.
+ignore_packages = []

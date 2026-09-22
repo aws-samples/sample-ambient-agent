@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: MIT-0
 import time
 import hashlib
+from typing import List, Optional
 from constructs import Construct
 from aws_cdk import (
     Stack,
+    Token,
     Duration,
     RemovalPolicy,
     CfnOutput,
@@ -328,6 +330,62 @@ class MultiAgentStack(Stack):
             ),
         )
 
+    def _nag_account(self) -> str:
+        """The account id as cdk-nag renders it in IAM5 finding text.
+
+        When the stack is environment-bound (AWS credentials or an
+        explicit env resolved a concrete account at synth time),
+        `self.account` is the literal 12-digit id and cdk-nag prints it
+        verbatim. When synthesizing environment-agnostically (fresh
+        clone, no AWS session - a fully supported `cdk synth` mode),
+        `self.account` is an unresolved token that renders into the
+        template as `{"Ref": "AWS::AccountId"}`, which cdk-nag prints
+        as the placeholder `<AWS::AccountId>`. Suppression `appliesTo`
+        strings must match the printed form exactly, so any suppression
+        embedding the account must go through this helper or it will
+        silently stop matching the moment synth runs without
+        credentials - failing the build out of the box.
+        """
+        if Token.is_unresolved(self.account):
+            return "<AWS::AccountId>"
+        return self.account
+
+    def _nag_region(self) -> str:
+        """Region as cdk-nag renders it in finding text (see _nag_account)."""
+        if Token.is_unresolved(self.region):
+            return "<AWS::Region>"
+        return self.region
+
+    def _agent_runtime_resource_arns(
+        self, account: Optional[str] = None
+    ) -> List[str]:
+        """Build the resource ARN list for bedrock-agentcore:InvokeAgentRuntime.
+
+        Always includes this stack's own deploy region, plus any region
+        listed in `allowed_agent_regions` (config.yml) - covering the case
+        where an operator registers an AgentCore runtime in a different
+        region than the backend stack without granting a bare `*` region
+        wildcard. Each region contributes both the runtime resource and
+        the runtime-endpoint resource, since InvokeAgentRuntime authorizes
+        against either.
+
+        `account` defaults to `self.account` (correct for real IAM policy
+        resources, where an unresolved token becomes a CFN intrinsic).
+        Pass `self._nag_account()` instead when building cdk-nag
+        suppression strings, which must match the rendered finding text.
+        """
+        account = self.account if account is None else account
+        regions = {self.region, *(self.config.allowed_agent_regions or [])}
+        resources: List[str] = []
+        for region in sorted(regions):
+            resources.append(
+                f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/*"
+            )
+            resources.append(
+                f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/*/runtime-endpoint/*"
+            )
+        return resources
+
     def _create_agent_registry_table(self) -> dynamodb.Table:
         """Create DynamoDB table for agent registry"""
         table = dynamodb.Table(
@@ -641,21 +699,20 @@ class MultiAgentStack(Stack):
         # Grant Bedrock Agent Core permissions.
         # The agent registry stores full ARNs from whatever region the user
         # deployed the AgentCore runtime in (e.g., us-east-1), which may
-        # differ from this stack's region. Use a region wildcard so the
-        # Lambda can invoke runtimes registered from any region in this
-        # account. InvokeAgentRuntime authorizes against both the runtime
-        # resource and the runtime-endpoint resource, so both patterns are
-        # granted.
+        # differ from this stack's region. Scoped to an explicit region
+        # allowlist (this stack's own region, plus `allowed_agent_regions`
+        # from config.yml) rather than a bare `*`, so registering an agent
+        # in another region doesn't grant InvokeAgentRuntime against every
+        # AWS region. InvokeAgentRuntime authorizes against both the
+        # runtime resource and the runtime-endpoint resource, so both
+        # patterns are granted for each allowed region.
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
                 actions=[
                     "bedrock-agentcore:InvokeAgentRuntime",
                 ],
-                resources=[
-                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
-                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
-                ],
+                resources=self._agent_runtime_resource_arns(),
             )
         )
 
@@ -996,16 +1053,14 @@ class MultiAgentStack(Stack):
         self.conversation_store_table.grant_read_write_data(lambda_role)
         self.agent_registry_table.grant_read_data(lambda_role)
 
-        # Same region-wildcard policy as the job executor so chat can invoke
-        # AgentCore runtimes registered in any region of this account.
+        # Same region-allowlisted policy as the job executor so chat can
+        # invoke AgentCore runtimes registered in this stack's region or
+        # any additional region listed in `allowed_agent_regions`.
         lambda_role.add_to_policy(
             iam.PolicyStatement(
                 effect=iam.Effect.ALLOW,
                 actions=["bedrock-agentcore:InvokeAgentRuntime"],
-                resources=[
-                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
-                    f"arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
-                ],
+                resources=self._agent_runtime_resource_arns(),
             )
         )
 
@@ -1100,6 +1155,15 @@ class MultiAgentStack(Stack):
             endpoint_types=[apigateway.EndpointType.REGIONAL],
             deploy_options=apigateway.StageOptions(
                 stage_name="prod",
+                # Stage-level throttling applies to EVERY request hitting
+                # the stage. The usage plan below carries the same
+                # rate/burst numbers, but usage-plan throttles only bind
+                # to requests presenting an API key - and this API uses
+                # Cognito authorizers, not API keys - so without these
+                # stage settings the platform would fall back to the
+                # account-level default limits only.
+                throttling_rate_limit=50,
+                throttling_burst_limit=100,
                 logging_level=apigateway.MethodLoggingLevel.INFO,
                 access_log_destination=apigateway.LogGroupLogDestination(
                     access_log_group
@@ -1128,10 +1192,13 @@ class MultiAgentStack(Stack):
             validate_request_parameters=True,
         )
 
-        # API throttling / usage plan. Attaches an account-wide usage
-        # plan with basic rate/burst/quota limits onto the `prod` stage
-        # instead of relying solely on API Gateway's account-level
-        # defaults.
+        # Usage plan with a daily quota, layered on top of the
+        # stage-level throttling set in `deploy_options` above. The
+        # stage throttle is what actually limits anonymous/Cognito
+        # traffic (usage-plan throttles only bind to API-key requests,
+        # and this API issues no API keys); the plan is kept for its
+        # daily quota ceiling and as a place to attach keys if any are
+        # added later.
         usage_plan = api.add_usage_plan(
             f"{self.config.stack_name}-MultiAgentUsagePlan",
             name=f"{self.config.stack_name}-multi-agent-usage-plan",
@@ -1912,24 +1979,30 @@ function handler(event) {
                         "Resource::<reactstarterWebsiteBucket50502CD9.Arn>/*",
                         # CDK's bootstrap asset bucket. Named
                         # `cdk-hnb659fds-assets-<account>-<region>` by
-                        # convention; built from account/region tokens
-                        # here rather than hardcoded so this suppression
-                        # doesn't only match the account/region used
-                        # when this list was generated.
-                        f"Resource::arn:aws:s3:::cdk-hnb659fds-assets-{self.account}-{self.region}/*",
-                        # AgentCore runtime ARNs use a literal region
-                        # wildcard (`*`) since the registered runtime may
-                        # live in a different region than this stack -
-                        # cdk-nag renders the account id literally here
-                        # rather than as a CFN token because it's spliced
-                        # into a plain f-string, not a Fn::Sub/Fn::Join.
-                        f"Resource::arn:aws:bedrock-agentcore:*:{self.account}:runtime/*",
-                        f"Resource::arn:aws:bedrock-agentcore:*:{self.account}:runtime/*/runtime-endpoint/*",
+                        # convention; built via _nag_account()/_nag_region()
+                        # so the string matches cdk-nag's rendered finding
+                        # both when synth is env-bound (literal ids) and
+                        # env-agnostic (<AWS::AccountId> placeholder, e.g.
+                        # a fresh clone with no AWS credentials).
+                        f"Resource::arn:aws:s3:::cdk-hnb659fds-assets-{self._nag_account()}-{self._nag_region()}/*",
+                        # AgentCore runtime ARNs still need a trailing
+                        # `runtime/*` wildcard per allowed region (the
+                        # runtime id itself isn't known at synth time).
+                        # Mirrors `_agent_runtime_resource_arns()`, so
+                        # this list grows/shrinks with `allowed_agent_regions`;
+                        # account rendered via _nag_account() to match
+                        # cdk-nag's finding text in both synth modes.
+                        *[
+                            f"Resource::{arn}"
+                            for arn in self._agent_runtime_resource_arns(
+                                account=self._nag_account()
+                            )
+                        ],
                         f"Resource::arn:aws:bedrock:{self.region}::foundation-model/anthropic.claude-*",
                         f"Resource::arn:aws:bedrock:{self.region}::foundation-model/us.anthropic.claude-*",
-                        f"Resource::arn:aws:bedrock:{self.region}:{self.account}:agent-alias/*/*",
-                        f"Resource::arn:aws:bedrock:{self.region}:{self.account}:agent/*",
-                        f"Resource::arn:aws:bedrock:{self.region}:{self.account}:inference-profile/us.anthropic.claude-*",
+                        f"Resource::arn:aws:bedrock:{self.region}:{self._nag_account()}:agent-alias/*/*",
+                        f"Resource::arn:aws:bedrock:{self.region}:{self._nag_account()}:agent/*",
+                        f"Resource::arn:aws:bedrock:{self.region}:{self._nag_account()}:inference-profile/us.anthropic.claude-*",
                         # CDK's built-in BucketDeployment custom resource
                         # (react-starter-UserInterfaceDeployment below)
                         # generates its own Lambda service role with a

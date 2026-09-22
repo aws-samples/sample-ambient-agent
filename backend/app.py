@@ -49,6 +49,7 @@ config = AppConfig(
     enable_waf=config_data.get("enable_waf", False),
     ip_allow_list=config_data.get("ip_allow_list"),
     cloudfront_cache_disable=config_data.get("cloudfront_cache_disable", False),
+    allowed_agent_regions=config_data.get("allowed_agent_regions"),
 )
 
 # Deploy base infrastructure stack

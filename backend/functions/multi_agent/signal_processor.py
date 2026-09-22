@@ -10,9 +10,10 @@ import json
 import boto3
 import uuid
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
 from aws_lambda_powertools import Logger
+from botocore.exceptions import ClientError
 from aws_lambda_powertools.metrics import MetricUnit, Metrics
 from aws_lambda_powertools.utilities.idempotency import (
     DynamoDBPersistenceLayer,
@@ -216,24 +217,51 @@ def process_s3_signal(event: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-def _within_auto_execute_cooldown(signal: Dict[str, Any]) -> bool:
-    """True if this signal auto-fired within the last cooldown window.
+def _try_claim_auto_execute_slot(signal_id: str) -> bool:
+    """Atomically claim the right to auto-execute this signal now.
 
-    Uses `lastTriggered` (already maintained by `update_signal_stats`,
-    written after every trigger regardless of autoExecute) as the last-
-    fired timestamp - no extra DynamoDB attribute or write is needed.
+    A conditional update on the signals BASE table (not the eventually-
+    consistent GSI the match query reads from) sets `lastAutoExecuteAt`
+    only if the stored value is absent or older than the cooldown
+    window. DynamoDB evaluates the condition and applies the write as
+    one atomic operation, so under a concurrent upload burst exactly
+    one invocation per window wins the claim - the old read-then-act
+    check on `lastTriggered` (read via the GSI, written only after job
+    creation) let every member of a burst pass before any of them had
+    written the timestamp.
+
+    ISO-8601 UTC timestamps of the same fixed format compare correctly
+    as strings, which is what the `<=` in the ConditionExpression
+    relies on.
+
+    Returns True if this invocation claimed the slot (safe to
+    auto-execute), False if another firing already claimed it within
+    the window.
     """
-    last_triggered = signal.get("lastTriggered")
-    if not last_triggered:
-        return False
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(seconds=AUTO_EXECUTE_COOLDOWN_SECONDS)).isoformat()
+    signals_table = dynamodb.Table(SIGNALS_TABLE)
     try:
-        last_dt = datetime.fromisoformat(last_triggered)
-    except ValueError:
-        return False
-    if last_dt.tzinfo is None:
-        last_dt = last_dt.replace(tzinfo=timezone.utc)
-    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-    return elapsed < AUTO_EXECUTE_COOLDOWN_SECONDS
+        signals_table.update_item(
+            Key={"signalId": signal_id},
+            UpdateExpression="SET lastAutoExecuteAt = :now",
+            ConditionExpression=(
+                "attribute_not_exists(lastAutoExecuteAt) "
+                "OR lastAutoExecuteAt <= :cutoff"
+            ),
+            ExpressionAttributeValues={
+                ":now": now.isoformat(),
+                ":cutoff": cutoff,
+            },
+        )
+        return True
+    except ClientError as exc:
+        if (
+            exc.response.get("Error", {}).get("Code")
+            == "ConditionalCheckFailedException"
+        ):
+            return False
+        raise
 
 
 def _create_task_for_signal_impl(
@@ -284,12 +312,14 @@ Payload: {json.dumps(payload, indent=2)}
         # Rate-limit auto-execute per signal: without a floor between
         # triggers, a burst of uploads to a watched prefix (accidental
         # or adversarial) turns directly into an unmetered burst of
-        # Bedrock invocations - a denial-of-wallet vector. If the signal
-        # last auto-fired within the cooldown window, the job still
-        # gets created (so nothing is silently dropped) but lands in
-        # `idle` for manual review instead of auto-firing.
+        # Bedrock invocations - a denial-of-wallet vector. The claim is
+        # an atomic conditional write (see _try_claim_auto_execute_slot)
+        # so a concurrent burst cannot all pass the check before any of
+        # them records a firing. Losers still get their job created (so
+        # nothing is silently dropped) but it lands in `idle` for
+        # manual review instead of auto-firing.
         auto_execute = bool(signal.get("autoExecute", False))
-        if auto_execute and _within_auto_execute_cooldown(signal):
+        if auto_execute and not _try_claim_auto_execute_slot(signal["signalId"]):
             logger.warning(
                 "autoExecute cooldown active; creating job as idle instead",
                 extra={"signal_id": signal["signalId"]},

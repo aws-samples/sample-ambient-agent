@@ -34,6 +34,13 @@ class AppConfig:
     environment_variables: Optional[Dict[str, str]] = None
     monitoring: Optional[MonitoringConfig] = None
     cognito: Optional[CognitoConfig] = None
+    # AWS regions the job-execution/chat-execution Lambda roles are allowed
+    # to call bedrock-agentcore:InvokeAgentRuntime in, in addition to this
+    # stack's own deploy region (always included). Supports registering an
+    # AgentCore runtime in a different region than the backend stack
+    # without granting a blanket region wildcard. Defaults to just the
+    # stack's own region if not set in config.yml.
+    allowed_agent_regions: Optional[List[str]] = None
 
     def __post_init__(self):
         if self.environment_variables is None:
@@ -48,3 +55,6 @@ class AppConfig:
         # Require cognito config to be explicitly provided
         if self.cognito is None:
             raise ValueError("cognito configuration must be specified in config.yml")
+
+        if self.allowed_agent_regions is None:
+            self.allowed_agent_regions = []

@@ -44,7 +44,7 @@ class InfrastructureStack(Stack):
             # then conflicts with `mfa_second_factor(sms=False)` below:
             # Cognito refuses "turn off SMS_MFA while SMS configuration
             # is set" on an update. Dropping phone verification removes
-            # the SMS config so TOTP-only optional MFA can deploy.
+            # the SMS config so TOTP-only MFA can deploy.
             auto_verify=cognito.AutoVerifiedAttrs(email=True),
             sign_in_aliases=cognito.SignInAliases(email=True),
             password_policy=cognito.PasswordPolicy(
@@ -54,15 +54,18 @@ class InfrastructureStack(Stack):
                 require_digits=True,
                 require_symbols=True,
             ),
-            # Optional TOTP MFA. Not REQUIRED because self-signup is
-            # disabled and users are provisioned by an admin (see
-            # _create_cognito_users below), so there's no self-service
-            # enrollment flow to require it against; users can still
-            # turn it on. This satisfies cdk-nag AwsSolutions-COG2's
-            # underlying concern (some MFA path exists) without forcing
-            # every admin-created sample user through TOTP setup before
-            # their first sign-in.
-            mfa=cognito.Mfa.OPTIONAL,
+            # Required TOTP MFA (cdk-nag AwsSolutions-COG2 / ARCC BSC10
+            # only clear with MfaConfiguration=ON, not OPTIONAL). The
+            # frontend's Amplify `<Authenticator>` natively handles the
+            # CONTINUE_SIGN_IN_WITH_TOTP_SETUP and
+            # CONFIRM_SIGN_IN_WITH_TOTP_CODE challenge steps, so
+            # admin-provisioned users (see _create_cognito_users below)
+            # are walked through QR-code TOTP enrollment on their first
+            # sign-in - no custom enrollment UI is needed. On an
+            # existing pool this deploys as an in-place update; users
+            # who haven't enrolled yet are prompted at their next
+            # sign-in.
+            mfa=cognito.Mfa.REQUIRED,
             mfa_second_factor=cognito.MfaSecondFactor(
                 sms=False, otp=True, email=False
             ),

@@ -49,16 +49,19 @@ jobs:
       - name: Run ASH Security Scan
         run: |
           echo "Running ASH (Automated Security Helper) security analysis..."
-          # Pinned to a tagged release rather than the mutable `main`
-          # branch: `uvx git+https://...git` with no ref resolves
-          # whatever is at the tip of the default branch at run time,
-          # which is the supply-chain equivalent of `curl | sh` - a
-          # compromised or rewritten upstream `main` would execute in
-          # this workflow with `contents: read` / `security-events:
-          # write` permissions on every push and PR. Bump this tag
-          # deliberately when upgrading.
-          uvx git+https://github.com/awslabs/automated-security-helper.git@v3.7.1 --mode precommit
-        continue-on-error: true
+          # Pinned to the commit SHA of the v3.7.1 release rather than
+          # the mutable `main` branch or the tag name: `uvx
+          # git+https://...git` with no ref resolves whatever is at the
+          # tip of the default branch at run time, and even a tag can
+          # be re-pointed upstream - a compromised or rewritten ref
+          # would execute in this workflow with `contents: read` /
+          # `security-events: write` permissions on every push and PR.
+          # A commit SHA is immutable. Bump deliberately when upgrading.
+          #
+          # This step is intentionally BLOCKING (no continue-on-error):
+          # a PR that introduces a finding must fail the check, not
+          # merge green with the finding buried in an artifact.
+          uvx git+https://github.com/awslabs/automated-security-helper.git@af1206aff596f1288ad066828058b3011de2a998 --mode precommit  # v3.7.1
 
       - name: Upload ASH Results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -102,6 +105,12 @@ jobs:
             CONFIG_ARG=""
           fi
 
+          # Intentionally BLOCKING (no `|| true`, no continue-on-error
+          # on this step): a sensitive-data finding must fail the check
+          # rather than merge green as an advisory artifact. False
+          # positives belong in .devsecops/.ferret-scan-suppressions.yaml
+          # where the exemption is reviewable, not in a blanket
+          # exit-code swallow.
           ferret-scan \
             --recursive \
             --format sarif \
@@ -111,7 +120,7 @@ jobs:
             --no-color \
             --quiet \
             $CONFIG_ARG \
-            --file * || true
+            --file *
 
           if [ -f "ferret-scan-results.sarif" ]; then
             echo "✓ Ferret Scan completed successfully"
@@ -123,7 +132,6 @@ jobs:
           else
             echo "⚠ Warning: Ferret Scan report not generated"
           fi
-        continue-on-error: true
 
       - name: Upload Ferret Scan Results to GitHub Security
         uses: github/codeql-action/upload-sarif@faaca9a8f6edddba5725ffe5adefdab6669a2eca # v3

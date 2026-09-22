@@ -108,9 +108,13 @@ Edit `config.yaml`:
   stack to. Bedrock Guardrails are region-scoped, so a mismatch here causes
   `ValidationException: The guardrail identifier or version provided in the
   request does not exist` at invoke time.
-- `aws.bedrock.guardrail_id` / `aws.bedrock.guardrail_version` — copy from the
-  backend stack's `AgentGuardrailId` / `AgentGuardrailVersion` outputs (step 3),
-  so the agent's model calls are protected by a prompt-attack filter.
+- `aws.bedrock.guardrail_id` / `aws.bedrock.guardrail_version` — `deploy_agent.sh`
+  resolves these from the backend stack's `AgentGuardrailId` /
+  `AgentGuardrailVersion` outputs and writes them into `config.yaml`
+  automatically on every deploy (pass `--skip-guardrail-sync` to manage them
+  by hand instead). The agent refuses to start without either value set —
+  see [Troubleshooting](#troubleshooting) if you need to run unguarded for
+  local development.
 - Customize model, tools, and prompts as needed.
 
 ```bash
@@ -217,10 +221,12 @@ Edit `config.yaml`:
   deployed to (Part 1, Step 3). Bedrock Guardrails are region-scoped; a
   mismatch produces `ValidationException: The guardrail identifier or
   version provided in the request does not exist` at invoke time.
-- `aws.bedrock.guardrail_id` / `aws.bedrock.guardrail_version` — copy from the
-  backend stack's `AgentGuardrailId` / `AgentGuardrailVersion` outputs
-  (Part 1, Step 3), so the agent's model calls are protected by a
-  prompt-attack filter.
+- `aws.bedrock.guardrail_id` / `aws.bedrock.guardrail_version` — `deploy_agent.sh`
+  (Step 5) resolves these automatically from the backend stack's
+  `AgentGuardrailId` / `AgentGuardrailVersion` outputs and writes them into
+  `config.yaml` on every deploy; no manual copy needed. The agent refuses
+  to start if they're unset (see Troubleshooting below for the local-dev
+  opt-out).
 - Customize model, tools, and prompts as needed.
 
 #### Step 5: Deploy Agent
@@ -256,7 +262,11 @@ AgentCore project somewhere other than `../AmbientAgent`.
 #### Step 6: Register Agent in Platform
 
 1. Open the CloudFront URL in your browser
-2. Log in with Cognito credentials (check email for temp password)
+2. Log in with Cognito credentials (check email for temp password).
+   MFA is required: on first sign-in you'll be walked through TOTP
+   setup — scan the QR code with an authenticator app (e.g. Google
+   Authenticator, Authy) and enter the 6-digit code. Subsequent
+   sign-ins ask for the current code.
 3. Navigate to **Agents** page
 4. Click **"Register New Agent"**
 5. Fill in:
@@ -556,6 +566,42 @@ Check the **Jobs** page - a new job should be automatically created!
    credentials (CDK bootstrap role assumption) — see
    `AmbientAgent/agentcore/.cli/logs/import/` or `deploy/` for detailed logs.
 6. Check deployment logs via `agentcore logs --runtime ambient`.
+
+### Agent Says S3 Permissions Are Not Configured
+
+If the agent responds with something like "the necessary S3 bucket
+permissions haven't been configured," the cause is usually not IAM: the
+agent's S3 tool enforces its own in-process bucket allowlist, read from
+`AGENT_S3_BUCKET_NAME` / `ALLOWED_S3_BUCKETS` in the **deployed
+runtime's** environment, and it refuses every request when neither is
+set (fail-closed). `deploy_agent.sh` syncs these from `agent/.env` into
+the runtime's `envVars` in `agentcore.json` on every deploy — if you
+hit this, make sure `AGENT_S3_BUCKET_NAME` is set in `agent/.env`
+(to the `SignalUploadsBucketName` stack output) and re-run
+`./deploy_agent.sh`.
+
+### Agent Fails to Start with `GuardrailNotConfiguredError`
+
+The agent refuses to start if `aws.bedrock.guardrail_id`/`guardrail_version`
+are unset in `config.yaml` — it never runs unguarded against untrusted,
+model-facing input (uploaded files, signal metadata) without an explicit
+decision to do so.
+
+**Solution**:
+
+1. Normally nothing to do — `deploy_agent.sh` resolves these automatically
+   from the backend stack's `AgentGuardrailId`/`AgentGuardrailVersion`
+   outputs on every deploy. This error means that sync didn't run or
+   couldn't find the stack (e.g. wrong region, backend stack not deployed
+   yet, or you passed `--skip-guardrail-sync`).
+2. Re-run `./deploy_agent.sh` (without `--skip-guardrail-sync`) once the
+   backend stack is deployed in the same account/region as `AWS_DEFAULT_REGION`
+   in `agent/.env`.
+3. To run unguarded for local development only, set
+   `ALLOW_UNGUARDED_AGENT=true` in the environment before starting the
+   agent process. Do not use this for any real deployment — nothing then
+   filters prompt-injection attempts in uploaded file content or signal
+   metadata before it reaches the model.
 
 ### Jobs Stay in "Busy" Status
 

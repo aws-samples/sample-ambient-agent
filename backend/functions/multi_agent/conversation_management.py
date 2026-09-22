@@ -237,6 +237,26 @@ def add_conversation_message(
         if not message_type or not content:
             return create_response(400, {"error": "Message type and content required"})
 
+        # Same bound as chat_management.py's MAX_MESSAGE_LENGTH: this
+        # endpoint appends to the same conversation-store table the
+        # agent replays into model history, so without a matching check
+        # here an oversized turn posted directly to
+        # POST /conversations/{sessionId} would bypass the chat bound -
+        # inflating every subsequent Bedrock call for the thread
+        # (denial-of-wallet) and pushing the item toward DynamoDB's
+        # 400KB limit.
+        max_message_length = 8000
+        if not isinstance(content, str) or len(content) > max_message_length:
+            return create_response(
+                400,
+                {
+                    "error": (
+                        f"content must be a string of {max_message_length} "
+                        "characters or fewer"
+                    )
+                },
+            )
+
         # Only the human side of a turn can be written by an API
         # caller. "ai" turns are meant to come from the agent-execution
         # path (job_execution/chat_execution), not directly from a

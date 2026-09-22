@@ -9,7 +9,6 @@ description = "Ambient agent for the Multi-Agent Platform (LangChain/LangGraph o
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "autopep8>=2.0.0,<3.0.0",
     # Required for the AgentCore Runtime's OTEL auto-instrumentation
     # (`opentelemetry-instrument`, see Dockerfile's CMD from the old
     # container-based deploy). Without it CodeZip deploys fail at
@@ -28,17 +27,26 @@ dependencies = [
     "pyasn1>=0.6.3,<1.0.0",
     "requests>=2.33.0,<3.0.0",
     "simpleeval>=1.0.0,<2.0.0",
-    "tavily-python>=0.5.0,<1.0.0",
 ]
 
-# pylint and autopep8 are dev-only tooling in the original
-# requirements.txt; kept out of the runtime dependency set the
-# AgentCore CDK build packages into the deployed image, but still
-# installable locally via `pip install -e .[dev]`.
+# pylint and autopep8 are dev-only lint/format tooling (pylint pulls in
+# GPL-licensed astroid, so keeping it out of the runtime set also keeps
+# the shipped artifact free of copyleft dependencies); kept out of the
+# runtime dependency set the AgentCore CDK build packages into the
+# deployed artifact, but still installable locally via
+# `pip install -e .[dev]` or requirements-dev.txt.
+# tavily-python was removed outright: nothing in the agent references it.
 [project.optional-dependencies]
 dev = [
+    "autopep8>=2.0.0,<3.0.0",
     "pylint>=3.0.0,<4.0.0",
+    "pytest>=8.0.0,<9.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that call real AWS APIs (skipped unless GUARDRAIL_INTEGRATION=1)",
+]

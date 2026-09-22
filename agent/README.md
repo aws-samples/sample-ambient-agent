@@ -381,6 +381,19 @@ print(result)
   doesn't match the region the guardrail was created in (the backend
   stack's region). Fix and redeploy with `./deploy_agent.sh`.
 
+### Agent Fails to Start with `GuardrailNotConfiguredError`
+
+The agent fails closed (refuses to start) if `aws.bedrock.guardrail_id`/
+`guardrail_version` are unset in `config.yaml` — see
+`core/agent_core.py`'s `resolve_chat_bedrock_kwargs`. `deploy_agent.sh`
+resolves and writes these from the backend stack's `AgentGuardrailId`/
+`AgentGuardrailVersion` outputs on every deploy (skip with
+`--skip-guardrail-sync`). If you hit this error, either re-run the deploy
+script against a deployed backend stack, or set `config.yaml`'s guardrail
+fields by hand. For local development only, set
+`ALLOW_UNGUARDED_AGENT=true` in the process environment to run without a
+guardrail - never use this for a real deployment.
+
 ### Agent Deployment Fails with "OpenTelemetry instrumentation executable not found"
 
 - `agent/pyproject.toml` is missing `aws-opentelemetry-distro` — required

@@ -1,0 +1,42 @@
+# Automated Security Helper (ASH) configuration
+# https://github.com/awslabs/automated-security-helper
+#
+# ASH auto-discovers this file at the repository root, so the CI command
+# (`uvx ... --mode precommit`) picks it up with no extra flags.
+#
+# Failure semantics are intentionally left at their strict defaults:
+#   fail_on_findings: true            (a real finding fails the check)
+#   global_settings.severity_threshold: MEDIUM
+# so this file only ever *narrows* what is scanned or suppresses a documented
+# false positive - it never relaxes the bar for genuine findings.
+
+global_settings:
+  ignore_paths:
+    # Generated CDK synth output. These templates are rebuilt on every `cdk
+    # synth`/deploy and are gitignored (see .gitignore `cdk.out`), so they do
+    # not exist on a clean CI checkout. Excluding them keeps a local ASH run
+    # (which may have a populated cdk.out/) consistent with CI instead of
+    # failing on transient generated artifacts.
+    - path: "**/cdk.out/**"
+      reason: "Generated CDK synth output; rebuilt on deploy and gitignored, absent on clean CI checkout."
+    # Installed third-party dependencies. Gitignored (see .gitignore
+    # `node_modules`) and absent on a clean CI checkout. Dependency
+    # vulnerabilities are governed by the committed package-lock.json and the
+    # npm audit workflow, not by scanning vendored install trees.
+    - path: "**/node_modules/**"
+      reason: "Vendored npm dependencies; gitignored and absent on clean CI checkout."
+    # Local Python virtualenvs used during development/verification.
+    - path: "**/.venv*/**"
+      reason: "Local Python virtualenvs; never committed."
+
+  suppressions:
+    # The ferret-scan suppressions file stores SHA-256 fingerprints of
+    # previously-triaged ferret-scan findings (the `hash`, `context_hash`, and
+    # `match_text_hash` fields). detect-secrets flags every 64-char hex digest
+    # as a "Hex High Entropy String". These are content hashes, not secrets -
+    # there is no credential to leak - so the finding is a false positive on
+    # this specific file only. Scoped to the single file + rule so real secrets
+    # anywhere else still fail the scan.
+    - path: ".devsecops/.ferret-scan-suppressions.yaml"
+      rule_id: "SECRET-HEX-HIGH-ENTROPY-STRING"
+      reason: "File stores SHA-256 finding fingerprints (hash/context_hash/match_text_hash), not secrets; hex digests trip detect-secrets' entropy heuristic."

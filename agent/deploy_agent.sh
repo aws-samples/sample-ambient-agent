@@ -189,6 +189,134 @@ source_env() {
     fi
 }
 
+# Function to resolve the backend stack's AgentGuardrailId/
+# AgentGuardrailVersion outputs and write them into config.yaml.
+#
+# Without this, an operator who forgets the manual copy-paste step
+# deploys an agent that (per agent/core/agent_core.py's fail-closed
+# check) refuses to start at all - better than silently running
+# unguarded, but still a deploy that shouldn't need a manual step in
+# the first place. This makes the common case (single backend stack,
+# same account/region as the agent) fully automatic; `--skip-guardrail-sync`
+# opts out for anyone managing config.yaml by hand or using a
+# non-CDK-managed guardrail.
+sync_guardrail_config() {
+    if [ "$SKIP_GUARDRAIL_SYNC" = "true" ]; then
+        log "Skipping guardrail config sync (--skip-guardrail-sync)"
+        return 0
+    fi
+
+    if [ ! -f "$SCRIPT_DIR/config.yaml" ]; then
+        log_warning "config.yaml not found in agent/ - skipping guardrail sync."
+        log "Copy config.example.yaml to config.yaml first, then re-run."
+        return 0
+    fi
+
+    local backend_config="$SCRIPT_DIR/../backend/config.yml"
+    if [ ! -f "$backend_config" ]; then
+        log_warning "Could not find $backend_config - skipping guardrail sync."
+        log "Set aws.bedrock.guardrail_id/guardrail_version in config.yaml manually,"
+        log "or pass --skip-guardrail-sync to silence this check."
+        return 0
+    fi
+
+    if ! python3 -c "import yaml" >/dev/null 2>&1; then
+        log_warning "PyYAML not available to python3 - skipping guardrail sync."
+        log "Set aws.bedrock.guardrail_id/guardrail_version in config.yaml manually,"
+        log "or run this script from an environment with PyYAML installed"
+        log "(e.g. 'pip install -r requirements.txt' inside agent/)."
+        return 0
+    fi
+
+    local backend_stack_name multi_agent_stack_name
+    backend_stack_name=$(python3 -c "
+import yaml
+with open('$backend_config', encoding='utf-8') as fh:
+    doc = yaml.safe_load(fh)
+print(doc.get('stack_name', ''))
+" 2>/dev/null || true)
+    if [ -z "$backend_stack_name" ]; then
+        log_warning "Could not read stack_name from $backend_config - skipping guardrail sync."
+        return 0
+    fi
+    multi_agent_stack_name="${backend_stack_name}-MultiAgent"
+
+    log "Resolving guardrail outputs from stack '$multi_agent_stack_name'..."
+    local outputs_json
+    outputs_json=$(aws cloudformation describe-stacks \
+        --stack-name "$multi_agent_stack_name" \
+        --region "$AWS_DEFAULT_REGION" \
+        --query 'Stacks[0].Outputs' \
+        --output json 2>/dev/null || true)
+
+    if [ -z "$outputs_json" ] || [ "$outputs_json" = "null" ]; then
+        log_warning "Could not read outputs from stack '$multi_agent_stack_name' in"
+        log_warning "region $AWS_DEFAULT_REGION. Has the backend stack been deployed there?"
+        log "Set aws.bedrock.guardrail_id/guardrail_version in config.yaml manually,"
+        log "or pass --skip-guardrail-sync to silence this check."
+        return 0
+    fi
+
+    local guardrail_id guardrail_version
+    guardrail_id=$(echo "$outputs_json" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o.get('OutputKey') == 'AgentGuardrailId':
+        print(o.get('OutputValue', ''))
+        break
+" 2>/dev/null || true)
+    guardrail_version=$(echo "$outputs_json" | python3 -c "
+import json, sys
+outputs = json.load(sys.stdin)
+for o in outputs:
+    if o.get('OutputKey') == 'AgentGuardrailVersion':
+        print(o.get('OutputValue', ''))
+        break
+" 2>/dev/null || true)
+
+    if [ -z "$guardrail_id" ] || [ -z "$guardrail_version" ]; then
+        log_warning "Stack '$multi_agent_stack_name' has no AgentGuardrailId/AgentGuardrailVersion"
+        log_warning "outputs - skipping guardrail sync."
+        return 0
+    fi
+
+    # Targeted regex substitution rather than a full yaml.safe_load +
+    # yaml.safe_dump round-trip - config.yaml carries substantial
+    # hand-written comments (guardrail rationale, tuning notes for
+    # max_iterations/circuit_breaker, etc.) that a generic YAML dumper
+    # would silently drop. This only rewrites the two `guardrail_*`
+    # value lines, leaving every comment and the rest of the file
+    # untouched. Requires config.yaml to already declare both keys
+    # under aws.bedrock (as config.example.yaml does) - if it doesn't,
+    # nothing is substituted and this warns instead of guessing where
+    # to insert them.
+    python3 -c "
+import re
+import sys
+path = '$SCRIPT_DIR/config.yaml'
+with open(path, encoding='utf-8') as fh:
+    text = fh.read()
+new_text, n_id = re.subn(
+    r'^(\s*guardrail_id:).*$', r'\g<1> \"$guardrail_id\"', text, count=1, flags=re.MULTILINE
+)
+new_text, n_version = re.subn(
+    r'^(\s*guardrail_version:).*$', r'\g<1> \"$guardrail_version\"', new_text, count=1, flags=re.MULTILINE
+)
+if n_id == 0 or n_version == 0:
+    print('MISSING_KEYS', file=sys.stderr)
+    sys.exit(1)
+with open(path, 'w', encoding='utf-8') as fh:
+    fh.write(new_text)
+" || {
+        log_warning "config.yaml has no existing aws.bedrock.guardrail_id/guardrail_version"
+        log_warning "keys to update - skipping guardrail sync. Add them (see config.example.yaml)"
+        log_warning "then re-run, or set them manually."
+        return 0
+    }
+    log_success "Synced guardrail_id/guardrail_version into config.yaml from '$multi_agent_stack_name'"
+}
+
 # Function to attach IAM policies to agent role
 #
 # The runtime is deployed against a pre-existing role pinned via
@@ -210,8 +338,16 @@ attach_agent_policies() {
     if ./attach_agent_policies.sh "$EXECUTION_ROLE_ARN"; then
         log_success "Policies attached successfully"
     else
-        log_warning "Policy attachment failed"
-        log "You can manually attach policies later by running: cd agent && ./attach_agent_policies.sh <role-arn-or-name>"
+        # Hard failure on purpose: a runtime whose role is missing (or
+        # carrying stale) IAM policies deploys "successfully" and then
+        # fails at first use with confusing S3/Bedrock permission
+        # errors. Better to stop the deploy here than report success
+        # for an agent that can't do its job.
+        log_error "Policy attachment failed - the deployed agent would not have"
+        log_error "working S3/Bedrock permissions. Fix the error above and re-run,"
+        log_error "or run: cd agent && ./attach_agent_policies.sh <role-arn-or-name>"
+        cd "$ORIGINAL_DIR"
+        exit 1
     fi
 
     cd "$ORIGINAL_DIR"
@@ -300,6 +436,15 @@ for rt in doc.get('runtimes', []):
     if [ -n "$ROLE_ARN_OVERRIDE" ]; then
         EXECUTION_ROLE_ARN="$ROLE_ARN_OVERRIDE"
         log "Using --role-arn override: $EXECUTION_ROLE_ARN"
+        # Pin the override into agentcore.json, same as the created-role
+        # branch below. Without this, `agentcore deploy` (which reads
+        # executionRoleArn from agentcore.json, not from this script's
+        # variables) would deploy the runtime under whatever role is
+        # already pinned there - while attach_agent_policies scopes the
+        # IAM policies onto the override role instead: the runtime ends
+        # up running under a different role than the one the policies
+        # were attached to.
+        pin_execution_role "$EXECUTION_ROLE_ARN"
     elif [ -z "$EXECUTION_ROLE_ARN" ]; then
         log_warning "No executionRoleArn set for runtime '$AGENT_NAME' - creating one."
         EXECUTION_ROLE_ARN=$(create_execution_role)
@@ -373,17 +518,27 @@ EOF
 # pick it up without re-creating a role every time.
 pin_execution_role() {
     local role_arn="$1"
+    # Operator-supplied values (--role-arn, --agent-name, --project-dir)
+    # are passed to Python through the environment rather than being
+    # interpolated into the -c source, so a value containing quotes or
+    # python syntax can't change what the snippet executes.
+    PIN_CONFIG_PATH="$PROJECT_DIR/agentcore/agentcore.json" \
+    PIN_AGENT_NAME="$AGENT_NAME" \
+    PIN_ROLE_ARN="$role_arn" \
     python3 -c "
 import json
-path = '$PROJECT_DIR/agentcore/agentcore.json'
+import os
+path = os.environ['PIN_CONFIG_PATH']
+agent_name = os.environ['PIN_AGENT_NAME']
+role_arn = os.environ['PIN_ROLE_ARN']
 with open(path, encoding='utf-8') as fh:
     doc = json.load(fh)
 for rt in doc.get('runtimes', []):
-    if rt.get('name') == '$AGENT_NAME':
-        rt['executionRoleArn'] = '$role_arn'
+    if rt.get('name') == agent_name:
+        rt['executionRoleArn'] = role_arn
         break
 else:
-    raise SystemExit(f\"No runtime named '$AGENT_NAME' in {path}\")
+    raise SystemExit(f'No runtime named {agent_name!r} in {path}')
 with open(path, 'w', encoding='utf-8') as fh:
     json.dump(doc, fh, indent=2)
     fh.write('\n')
@@ -456,6 +611,7 @@ main() {
     check_prerequisites
     bootstrap_agentcore_project
     source_env
+    sync_guardrail_config
     resolve_execution_role
 
     if [ "$POLICIES_ONLY" = "true" ]; then
@@ -479,6 +635,7 @@ main() {
 EXECUTION_ROLE_ARN=""
 ROLE_ARN_OVERRIDE=""
 POLICIES_ONLY="false"
+SKIP_GUARDRAIL_SYNC="false"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -491,14 +648,22 @@ while [[ $# -gt 0 ]]; do
             echo "against the sibling AgentCore project at ../AmbientAgent."
             echo ""
             echo "Options:"
-            echo "  --role-arn <ARN>    Execution role to use if agentcore.json's"
-            echo "                      runtime entry has no executionRoleArn set."
+            echo "  --role-arn <ARN>    Execution role for the runtime. Takes precedence"
+            echo "                      over any executionRoleArn already in agentcore.json"
+            echo "                      and is pinned back into agentcore.json so the"
+            echo "                      deploy and the attached IAM policies use the same role."
             echo "  --project-dir <dir> AgentCore project directory (default: ../AmbientAgent)."
             echo "  --agent-name <name> Runtime name within the project (default: ambient)."
             echo "  --policies-only     Re-sync the execution role's IAM policy from"
             echo "                      agent/policies/*.json without a full 'agentcore deploy'."
             echo "                      Use this after editing a policies/*.json file when the"
             echo "                      runtime itself doesn't need re-provisioning."
+            echo "  --skip-guardrail-sync"
+            echo "                      Don't resolve/write aws.bedrock.guardrail_id and"
+            echo "                      guardrail_version into config.yaml from the backend"
+            echo "                      stack's AgentGuardrailId/AgentGuardrailVersion outputs."
+            echo "                      Use this if you manage those values by hand or point"
+            echo "                      at a guardrail this stack didn't create."
             echo "  --help, -h          Show this help message"
             echo ""
             echo "Prerequisites:"
@@ -519,6 +684,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --policies-only)
             POLICIES_ONLY="true"
+            shift
+            ;;
+        --skip-guardrail-sync)
+            SKIP_GUARDRAIL_SYNC="true"
             shift
             ;;
         --role-arn)

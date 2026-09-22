@@ -146,7 +146,7 @@ merge_policies() {
     # placeholder left unresolved (empty/unset env var) aborts the
     # merge rather than silently attaching a policy with a literal
     # "${...}" resource ARN.
-    python - "$policies_dir" "$output_file" <<'PY'
+    python3 - "$policies_dir" "$output_file" <<'PY'
 import glob
 import json
 import os

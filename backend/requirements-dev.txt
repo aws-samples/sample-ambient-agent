@@ -9,6 +9,12 @@
 # Test runner for the contract test suite in tests/contracts.
 pytest>=8.0.0,<9.0.0
 
+# Lint/format tooling. Dev-only: pylint pulls in GPL/LGPL-licensed
+# dependencies (astroid), so keeping it out of requirements.txt keeps
+# the license-compliance scan of shipped dependencies clean.
+autopep8>=2.0.0,<3.0.0
+pylint>=3.0.0,<4.0.0
+
 # Powertools is normally provided by the Lambda managed layer, so we do
 # not ship it in requirements.txt. For local tests we need it explicitly
 # so `job_execution` and `signal_processor` modules can be imported.

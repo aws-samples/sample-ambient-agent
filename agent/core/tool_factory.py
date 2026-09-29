@@ -80,6 +80,11 @@ class ToolFactory:
                 "description", "Ask a human for input or clarification"
             ),
             func=create_human_input_tool_func(),
+            # End the graph run as soon as the tool returns so the model
+            # never gets another turn (and cannot act) before the human
+            # answers. The orchestrator then converts the sentinel into
+            # an `interrupted` response.
+            return_direct=True,
         )
 
     @staticmethod

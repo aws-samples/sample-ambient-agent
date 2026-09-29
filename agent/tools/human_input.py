@@ -4,7 +4,10 @@
 Human input tool - request clarification from a human user.
 
 The tool returns a sentinel string that the orchestrator in
-`core.agent_core` detects after the LangGraph run finishes. A tool cannot
+`core.agent_core` detects after the LangGraph run finishes. The tool is
+registered with `return_direct=True` (see `core.tool_factory`), so the
+run ends as soon as it returns and the model gets no further turn before
+the human answers. A tool cannot
 raise to signal an interrupt here because LangGraph's tool node captures
 exceptions as error observations and feeds them back to the model.
 """

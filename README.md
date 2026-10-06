@@ -1,6 +1,8 @@
 # Multi-Agent Platform
 
-A production-ready platform for managing and orchestrating multiple Bedrock Agent Core agents with automated task execution, conversation continuity, and ambient signal processing. Built with React, AWS CDK, and serverless architecture.
+A platform for managing and orchestrating multiple Bedrock Agent Core agents with automated task execution, conversation continuity, and ambient signal processing. Built with React, AWS CDK, and serverless architecture.
+
+> **⚠️ This is sample code, for non-production usage.** You should work with your security and legal teams to meet your organizational security, regulatory and compliance requirements before deployment.
 
 ## Table of Contents
 
@@ -147,7 +149,7 @@ Edit `config.yml`:
 
 ```yaml
 stack_name: bedrock-agent-core-agents
-cloudfront_cache_disable: true # Set to false for production
+cloudfront_cache_disable: true
 
 monitoring:
   alert_email: your-email@example.com
